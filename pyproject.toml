@@ -32,6 +32,11 @@ dependencies = [
   "kubeflow-trainer-api>=2.0.0",
 ]
 
+[project.optional-dependencies]
+docker = [
+  "docker>=6.1.3",
+]
+
 [dependency-groups]
 dev = [
   "pytest>=7.0",
