@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from kubeflow.trainer.backends.docker.backend import LocalDockerBackend
-from kubeflow.trainer.backends.docker.types import LocalDockerBackendConfig
+from kubeflow.trainer.backends.podman.backend import LocalPodmanBackend
+from kubeflow.trainer.backends.podman.types import LocalPodmanBackendConfig
 
-__all__ = ["LocalDockerBackend", "LocalDockerBackendConfig"]
+__all__ = ["LocalPodmanBackend", "LocalPodmanBackendConfig"]

@@ -13,13 +13,15 @@
 # limitations under the License.
 
 """
-DockerBackend
+PodmanBackend
 -------------
 
-Local execution backend for `CustomTrainer` jobs using Docker containers.
+Local execution backend for `CustomTrainer` jobs using Podman containers.
 
 Key behaviors:
-- Multi-node jobs: one container per node connected via a per-job Docker network.
+- Multi-node jobs: containers are connected via a Podman network, giving each
+  container its own network interface for proper distributed training with
+  name-based DNS resolution (similar to Docker).
 - Entry script generation: we serialize the user's training function to a small
   Python file and invoke it inside the container using `torchrun` (preferred) or
   `python` as a fallback.
@@ -29,7 +31,9 @@ Key behaviors:
 - Image pulling: controlled via `pull_policy` and performed automatically if
   needed.
 - Logs and lifecycle: streaming logs and deletion semantics similar to the
-  Kubernetes backend, but tailored to Docker.
+  Docker backend.
+- Networking: Uses Podman networks (not pods) so each container has its own
+  network interface, enabling proper PyTorch distributed training communication.
 """
 
 from __future__ import annotations
@@ -39,36 +43,37 @@ import logging
 from pathlib import Path
 
 try:
-    import docker  # type: ignore
+    import podman  # type: ignore
 except Exception:  # pragma: no cover - optional dependency, validated at runtime
-    docker = None  # type: ignore
+    podman = None  # type: ignore
 
 from kubeflow.trainer.backends.container_base import ContainerBackend
-from kubeflow.trainer.backends.docker.runtime_loader import (
+from kubeflow.trainer.backends.podman.runtime_loader import (
     get_local_runtime,
     list_local_runtimes,
 )
-from kubeflow.trainer.backends.docker.types import LocalDockerBackendConfig
+from kubeflow.trainer.backends.podman.types import LocalPodmanBackendConfig
 from kubeflow.trainer.types import types
 
 logger = logging.getLogger(__name__)
 
 
-class LocalDockerBackend(ContainerBackend):
-    def __init__(self, cfg: LocalDockerBackendConfig):
-        if docker is None:
+class LocalPodmanBackend(ContainerBackend):
+    def __init__(self, cfg: LocalPodmanBackendConfig):
+        if podman is None:
             raise ImportError(
-                "The 'docker' Python package is not installed. Install with extras: "
-                "pip install kubeflow[docker]"
+                "The 'podman' Python package is not installed. Install with extras: "
+                "pip install kubeflow[podman]"
             )
 
         super().__init__(label_prefix="trainer.kubeflow.org")
 
-        # initialize docker client (env-based resolution by default)
-        if cfg.docker_host:
-            self.client = docker.DockerClient(base_url=cfg.docker_host)
+        # Initialize Podman client
+        if cfg.podman_url:
+            self.client = podman.PodmanClient(base_url=cfg.podman_url)
         else:
-            self.client = docker.from_env()
+            # Use system default socket
+            self.client = podman.PodmanClient()
 
         self.cfg = cfg
 
@@ -84,17 +89,23 @@ class LocalDockerBackend(ContainerBackend):
         return self.client
 
     def _create_network(self, job_name: str) -> str:
-        """Create a Docker network for the job."""
+        """
+        Create a Podman network for the job to enable container networking.
+
+        Unlike pods (which share network namespace), a Podman network gives each
+        container its own network interface, enabling proper distributed training.
+        """
         network_name = f"{job_name}-net"
         try:
             self.client.networks.get(network_name)
             return network_name
         except Exception:
             pass
-        # Create network with labels for filtering and management
+        # Create network with DNS enabled for hostname resolution
         self.client.networks.create(
             name=network_name,
-            check_duplicate=True,
+            driver="bridge",
+            dns_enabled=True,
             labels={
                 f"{self.label_prefix}/trainjob-name": job_name,
             },
@@ -102,7 +113,7 @@ class LocalDockerBackend(ContainerBackend):
         return network_name
 
     def _delete_network(self, network_id: str):
-        """Delete the Docker network."""
+        """Delete the Podman network."""
         try:
             net = self.client.networks.get(network_id)
             net.remove()
@@ -110,11 +121,11 @@ class LocalDockerBackend(ContainerBackend):
             pass
 
     def _get_master_addr(self, job_name: str, rank: int) -> str:
-        """Docker uses container names for DNS resolution."""
+        """Podman uses container names for DNS resolution within a network."""
         return f"{job_name}-node-0"
 
     def _get_master_port(self, rank: int) -> int:
-        """Docker uses a fixed port since containers are on different network endpoints."""
+        """Use a fixed port since containers are on different network endpoints."""
         return 29500
 
     def _create_and_start_container(
@@ -128,27 +139,30 @@ class LocalDockerBackend(ContainerBackend):
         volumes: dict[str, dict[str, str]],
         working_dir: str,
     ) -> str:
-        """Create and start a Docker container."""
+        """Create and start a Podman container on the network."""
+        # Use containers.run() which creates and starts in one step
+        # This is equivalent to: podman run --network <network_id> ...
         container = self.client.containers.run(
             image=image,
-            command=tuple(command),
+            command=command,
             name=name,
-            detach=True,
-            working_dir=working_dir,
             network=network_id,
+            working_dir=working_dir,
             environment=environment,
             labels=labels,
             volumes=volumes,
-            auto_remove=False,  # we control removal in delete_job
+            detach=True,
+            remove=False,  # Don't auto-remove, we control this in delete_job
         )
+
         return container.id
 
     def _get_container(self, container_id: str):
-        """Get Docker container by ID."""
+        """Get Podman container by ID."""
         return self.client.containers.get(container_id)
 
     def _container_logs(self, container_id: str, follow: bool) -> Iterator[str]:
-        """Stream logs from a Docker container."""
+        """Stream logs from a Podman container."""
         container = self._get_container(container_id)
         logs = container.logs(stream=bool(follow), follow=bool(follow))
         if follow:
@@ -164,21 +178,21 @@ class LocalDockerBackend(ContainerBackend):
                 yield str(logs)
 
     def _stop_container(self, container_id: str, timeout: int = 10):
-        """Stop a Docker container."""
+        """Stop a Podman container."""
         container = self._get_container(container_id)
         container.stop(timeout=timeout)
 
     def _remove_container(self, container_id: str, force: bool = True):
-        """Remove a Docker container."""
+        """Remove a Podman container."""
         container = self._get_container(container_id)
         container.remove(force=force)
 
     def _pull_image(self, image: str):
-        """Pull a Docker image."""
+        """Pull a Podman image."""
         self.client.images.pull(image)
 
     def _image_exists(self, image: str) -> bool:
-        """Check if Docker image exists locally."""
+        """Check if Podman image exists locally."""
         try:
             self.client.images.get(image)
             return True
@@ -186,27 +200,23 @@ class LocalDockerBackend(ContainerBackend):
             return False
 
     def _run_oneoff_container(self, image: str, command: list[str]) -> str:
-        """
-        Run a short-lived Docker container and return its stdout as a string.
-
-        Implementation detail:
-        - Use detach=False and remove=True so Docker SDK runs the container to
-          completion, returns combined logs as bytes, and cleans it up. This
-          avoids races where auto-removed containers disappear before .wait/.logs.
-        """
+        """Run a short-lived Podman container and return its logs."""
         try:
-            output = self.client.containers.run(
+            container = self.client.containers.create(
                 image=image,
-                command=tuple(command),
+                command=command,
                 detach=False,
                 remove=True,
             )
+            container.start()
+            container.wait()
+            logs = container.logs()
+
+            if isinstance(logs, (bytes, bytearray)):
+                return logs.decode("utf-8", errors="ignore")
+            return str(logs)
         except Exception as e:
             raise RuntimeError(f"One-off container failed to run: {e}") from e
-
-        if isinstance(output, (bytes, bytearray)):
-            return output.decode("utf-8", errors="ignore")
-        return str(output)
 
     def _get_pull_policy(self) -> str:
         return self.cfg.pull_policy
@@ -226,9 +236,9 @@ class LocalDockerBackend(ContainerBackend):
 
     def _get_runtimes_dir(self) -> Path:
         """Get the path to the local runtimes directory."""
-        from kubeflow.trainer.backends.docker.runtime_loader import LOCAL_RUNTIMES_DIR
+        from kubeflow.trainer.backends.podman.runtime_loader import LOCAL_RUNTIMES_DIR
         return LOCAL_RUNTIMES_DIR
 
     def _resolve_image(self, runtime: types.Runtime) -> str:
-        """Resolve the Docker image for a runtime."""
+        """Resolve the Podman image for a runtime."""
         return self._resolve_image_from_runtime(runtime, self.cfg.image)

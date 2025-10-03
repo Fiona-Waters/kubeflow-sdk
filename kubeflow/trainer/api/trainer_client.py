@@ -19,6 +19,8 @@ from typing import Optional, Union
 from kubeflow.common.types import KubernetesBackendConfig
 from kubeflow.trainer.backends.docker.backend import LocalDockerBackend
 from kubeflow.trainer.backends.docker.types import LocalDockerBackendConfig
+from kubeflow.trainer.backends.podman.backend import LocalPodmanBackend
+from kubeflow.trainer.backends.podman.types import LocalPodmanBackendConfig
 from kubeflow.trainer.backends.kubernetes.backend import KubernetesBackend
 from kubeflow.trainer.backends.localprocess.backend import (
     LocalProcessBackend,
@@ -37,6 +39,7 @@ class TrainerClient:
             KubernetesBackendConfig,
             LocalProcessBackendConfig,
             LocalDockerBackendConfig,
+            LocalPodmanBackendConfig,
         ] = None,
     ):
         """Initialize a Kubeflow Trainer client.
@@ -60,6 +63,8 @@ class TrainerClient:
             self.backend = LocalProcessBackend(backend_config)
         elif isinstance(backend_config, LocalDockerBackendConfig):
             self.backend = LocalDockerBackend(backend_config)
+        elif isinstance(backend_config, LocalPodmanBackendConfig):
+            self.backend = LocalPodmanBackend(backend_config)
         else:
             raise ValueError(f"Invalid backend config '{backend_config}'")
 
