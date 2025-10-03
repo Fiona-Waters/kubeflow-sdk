@@ -13,21 +13,21 @@
 # limitations under the License.
 
 """
-Types and configuration for the Docker backend.
-We keep the configuration surface area intentionally small for v1:
-Configuration options for Docker backend:
+Types and configuration for the Podman backend.
 
+Configuration options for Podman backend:
  - image: Optional explicit image. If omitted, use the image referenced by the
    selected runtime (e.g., torch_distributed) from `config/local_runtimes`.
  - pull_policy: Controls image pulling. Supported values: "IfNotPresent",
    "Always", "Never". The default is "IfNotPresent".
  - auto_remove: Whether to remove containers and networks when jobs are deleted.
    Defaults to True.
- - gpus: GPU support is not implemented for v1 (kept for future extensibility).
+ - gpus: GPU support using NVIDIA CDI or other device plugins. Defaults to None.
  - env: Optional global environment variables applied to all containers.
- - docker_host: Optional override for connecting to a remote/local Docker daemon.
-   By default, the Docker SDK resolves from environment variables or uses the
-   system default socket.
+ - podman_url: Optional override for connecting to a remote/local Podman socket.
+   By default, the Podman client resolves from environment variables or uses
+   the system default socket (e.g., unix:///run/user/1000/podman/podman.sock
+   for rootless, unix:///run/podman/podman.sock for rootful).
  - workdir_base: Base directory on the host to place per-job working dirs that
    are bind-mounted into containers as /workspace. Defaults to a path under the
    user's home directory for compatibility.
@@ -38,17 +38,11 @@ from typing import Optional, Union
 from pydantic import BaseModel, Field
 
 
-class LocalDockerBackendConfig(BaseModel):
+class LocalPodmanBackendConfig(BaseModel):
     image: Optional[str] = Field(default=None)
-    network: Optional[str] = Field(default=None)
     pull_policy: str = Field(default="IfNotPresent")
     auto_remove: bool = Field(default=True)
-    # In Python 3.9, avoid PEP 604 unions; use typing.Union/Optional instead.
-    # Define the type at module scope so Pydantic doesn't treat it as a field.
     gpus: Optional[Union[int, bool]] = Field(default=None)
     env: Optional[dict[str, str]] = Field(default=None)
-    docker_host: Optional[str] = Field(default=None)
-    # Base directory on the host to place per-job working dirs that are bind-mounted
-    # into containers as /workspace. Defaults to a path under the user's home to
-    # maximize compatibility with Docker Desktop file sharing on macOS/Windows.
+    podman_url: Optional[str] = Field(default=None)
     workdir_base: Optional[str] = Field(default=None)
