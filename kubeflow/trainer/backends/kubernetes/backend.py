@@ -509,14 +509,36 @@ class KubernetesBackend(ExecutionBackend):
             if not pod_list:
                 return trainjob
 
+            # Group Pods by role to handle multiple Pods per component
+            pods_by_role = {}
             for pod in pod_list.items:
                 # Pod must have labels to detect the TrainJob step.
-                # Every Pod always has a single TrainJob step.
                 if not (pod.metadata and pod.metadata.name and pod.metadata.labels and pod.spec):
                     raise Exception(f"TrainJob Pod is invalid: {pod}")
 
+                # Create a unique key for each role
+                role_key = (
+                    pod.metadata.labels[constants.JOBSET_RJOB_NAME_LABEL],
+                    int(pod.metadata.labels[constants.JOB_INDEX_LABEL])
+                )
+                
+                # Keep only the most recently created Pod for each role
+                if role_key not in pods_by_role:
+                    pods_by_role[role_key] = pod
+                else:
+                    # Compare creation timestamps to keep the most recent
+                    current_pod = pods_by_role[role_key]
+                    if (pod.metadata.creation_timestamp and 
+                        current_pod.metadata.creation_timestamp and
+                        pod.metadata.creation_timestamp > current_pod.metadata.creation_timestamp):
+                        pods_by_role[role_key] = pod
+
+            # Process only the most recent Pod for each role
+            for role_key, pod in pods_by_role.items():
+                replicated_job_name, job_index = role_key
+                
                 # Get the Initializer step.
-                if pod.metadata.labels[constants.JOBSET_RJOB_NAME_LABEL] in {
+                if replicated_job_name in {
                     constants.DATASET_INITIALIZER,
                     constants.MODEL_INITIALIZER,
                 }:
@@ -528,7 +550,7 @@ class KubernetesBackend(ExecutionBackend):
                         )
                     )
                 # Get the Node step.
-                elif pod.metadata.labels[constants.JOBSET_RJOB_NAME_LABEL] in {
+                elif replicated_job_name in {
                     constants.LAUNCHER,
                     constants.NODE,
                 }:
@@ -538,10 +560,11 @@ class KubernetesBackend(ExecutionBackend):
                             pod.spec,
                             pod.status,
                             trainjob.runtime,
-                            pod.metadata.labels[constants.JOBSET_RJOB_NAME_LABEL],
-                            int(pod.metadata.labels[constants.JOB_INDEX_LABEL]),
+                            replicated_job_name,
+                            job_index,
                         )
                     )
+
         except multiprocessing.TimeoutError as e:
             raise TimeoutError(
                 f"Timeout to list {constants.TRAINJOB_KIND}'s steps: {namespace}/{name}"
