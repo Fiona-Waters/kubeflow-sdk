@@ -16,11 +16,8 @@ from collections.abc import Iterator
 import logging
 from typing import Optional, Union
 
-from kubeflow.common.types import KubernetesBackendConfig
-from kubeflow.trainer.backends.docker.backend import LocalDockerBackend
-from kubeflow.trainer.backends.docker.types import LocalDockerBackendConfig
-from kubeflow.trainer.backends.podman.backend import LocalPodmanBackend
-from kubeflow.trainer.backends.podman.types import LocalPodmanBackendConfig
+from kubeflow.trainer.backends.container.backend import ContainerBackend
+from kubeflow.trainer.backends.container.types import ContainerBackendConfig
 from kubeflow.trainer.backends.kubernetes.backend import KubernetesBackend
 from kubeflow.trainer.backends.localprocess.backend import (
     LocalProcessBackend,
@@ -38,16 +35,16 @@ class TrainerClient:
         backend_config: Union[
             KubernetesBackendConfig,
             LocalProcessBackendConfig,
-            LocalDockerBackendConfig,
-            LocalPodmanBackendConfig,
+            ContainerBackendConfig,
         ] = None,
     ):
         """Initialize a Kubeflow Trainer client.
 
         Args:
-            backend_config: Backend configuration. Either KubernetesBackendConfig or
-                            LocalProcessBackendConfig, or None to use the backend's
-                            default config class. Defaults to KubernetesBackendConfig.
+            backend_config: Backend configuration. Either KubernetesBackendConfig,
+                            LocalProcessBackendConfig, ContainerBackendConfig,
+                            or None to use the backend's default config class.
+                            Defaults to KubernetesBackendConfig.
 
         Raises:
             ValueError: Invalid backend configuration.
@@ -61,10 +58,8 @@ class TrainerClient:
             self.backend = KubernetesBackend(backend_config)
         elif isinstance(backend_config, LocalProcessBackendConfig):
             self.backend = LocalProcessBackend(backend_config)
-        elif isinstance(backend_config, LocalDockerBackendConfig):
-            self.backend = LocalDockerBackend(backend_config)
-        elif isinstance(backend_config, LocalPodmanBackendConfig):
-            self.backend = LocalPodmanBackend(backend_config)
+        elif isinstance(backend_config, ContainerBackendConfig):
+            self.backend = ContainerBackend(backend_config)
         else:
             raise ValueError(f"Invalid backend config '{backend_config}'")
 

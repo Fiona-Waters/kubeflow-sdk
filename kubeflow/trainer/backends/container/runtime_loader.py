@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from kubeflow.trainer.backends.podman.backend import LocalPodmanBackend
-from kubeflow.trainer.backends.podman.types import LocalPodmanBackendConfig
+"""
+Runtime loader for the Container backend.
 
-__all__ = ["LocalPodmanBackend", "LocalPodmanBackendConfig"]
+This module provides container-agnostic imports for the shared local runtime loader.
+"""
+
+from kubeflow.trainer.backends.local_runtime_loader import (
+    LOCAL_RUNTIMES_DIR,
+    get_local_runtime,
+    list_local_runtimes,
+)
+
+__all__ = ["LOCAL_RUNTIMES_DIR", "get_local_runtime", "list_local_runtimes"]

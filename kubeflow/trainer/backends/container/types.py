@@ -13,42 +13,44 @@
 # limitations under the License.
 
 """
-Types and configuration for the Docker backend.
-We keep the configuration surface area intentionally small for v1:
-Configuration options for Docker backend:
+Types and configuration for the unified Container backend.
 
+This backend automatically detects and uses either Docker or Podman.
+It provides a single interface for container-based execution regardless
+of the underlying runtime.
+
+Configuration options:
  - image: Optional explicit image. If omitted, use the image referenced by the
    selected runtime (e.g., torch_distributed) from `config/local_runtimes`.
  - pull_policy: Controls image pulling. Supported values: "IfNotPresent",
    "Always", "Never". The default is "IfNotPresent".
  - auto_remove: Whether to remove containers and networks when jobs are deleted.
    Defaults to True.
- - gpus: GPU support is not implemented for v1 (kept for future extensibility).
+ - gpus: GPU support (implementation varies between Docker and Podman).
+   Defaults to None.
  - env: Optional global environment variables applied to all containers.
- - docker_host: Optional override for connecting to a remote/local Docker daemon.
-   By default, the Docker SDK resolves from environment variables or uses the
-   system default socket.
+ - container_host: Optional override for connecting to a remote/local container
+   daemon. By default, auto-detects from environment or uses system defaults.
+   For Docker: uses DOCKER_HOST or default socket.
+   For Podman: uses CONTAINER_HOST or default socket.
  - workdir_base: Base directory on the host to place per-job working dirs that
    are bind-mounted into containers as /workspace. Defaults to a path under the
    user's home directory for compatibility.
+ - runtime: Force use of a specific container runtime ("docker" or "podman").
+   If not set, auto-detects based on availability (tries Docker first, then Podman).
 """
 
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
 
-class LocalDockerBackendConfig(BaseModel):
+class ContainerBackendConfig(BaseModel):
     image: Optional[str] = Field(default=None)
-    network: Optional[str] = Field(default=None)
     pull_policy: str = Field(default="IfNotPresent")
     auto_remove: bool = Field(default=True)
-    # In Python 3.9, avoid PEP 604 unions; use typing.Union/Optional instead.
-    # Define the type at module scope so Pydantic doesn't treat it as a field.
     gpus: Optional[Union[int, bool]] = Field(default=None)
     env: Optional[dict[str, str]] = Field(default=None)
-    docker_host: Optional[str] = Field(default=None)
-    # Base directory on the host to place per-job working dirs that are bind-mounted
-    # into containers as /workspace. Defaults to a path under the user's home to
-    # maximize compatibility with Docker Desktop file sharing on macOS/Windows.
+    container_host: Optional[str] = Field(default=None)
     workdir_base: Optional[str] = Field(default=None)
+    runtime: Optional[Literal["docker", "podman"]] = Field(default=None)
