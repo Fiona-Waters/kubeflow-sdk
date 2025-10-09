@@ -20,7 +20,7 @@ import random
 import re
 import string
 import time
-from typing import Optional, Union
+from typing import List, Optional, Union
 import uuid
 
 from kubeflow_trainer_api import models
@@ -56,6 +56,54 @@ class KubernetesBackend(ExecutionBackend):
         self.core_api = client.CoreV1Api(k8s_client)
 
         self.namespace = cfg.namespace
+
+    def _select_best_pod_for_role(self, pods: List[models.IoK8sApiCoreV1Pod]) -> Optional[models.IoK8sApiCoreV1Pod]:
+        """
+        Select the best Pod for a role based on status priority and creation timestamp.
+        
+        Priority order:
+        1. Running or Succeeded Pods (prefer most recent)
+        2. Failed Pods (prefer most recent) 
+        3. Pending Pods (prefer most recent)
+        4. Unknown Pods (prefer most recent)
+        """
+        if not pods:
+            return None
+        
+        # Pod status priority (higher number = higher priority)
+        status_priority = {
+            constants.POD_RUNNING: 4,    # Highest priority
+            constants.POD_SUCCEEDED: 3,  # Second highest
+            constants.POD_FAILED: 2,     # Third priority
+            constants.POD_PENDING: 1,    # Low priority
+            constants.POD_UNKNOWN: 0,    # Lowest priority
+        }
+        
+        # Group Pods by status priority
+        pods_by_status = {}
+        for pod in pods:
+            status = pod.status.phase if pod.status else constants.POD_UNKNOWN
+            priority = status_priority.get(status, 0)
+            
+            if priority not in pods_by_status:
+                pods_by_status[priority] = []
+            pods_by_status[priority].append(pod)
+        
+        # Find the highest priority status that has Pods
+        highest_priority = max(pods_by_status.keys()) if pods_by_status else 0
+        candidate_pods = pods_by_status[highest_priority]
+        
+        # Among Pods with the same status, select the most recent one
+        if len(candidate_pods) == 1:
+            return candidate_pods[0]
+        
+        # Sort by creation timestamp (most recent first)
+        candidate_pods.sort(
+            key=lambda p: p.metadata.creation_timestamp or "",
+            reverse=True
+        )
+        
+        return candidate_pods[0]
 
     def list_runtimes(self) -> list[types.Runtime]:
         result = []
@@ -522,19 +570,20 @@ class KubernetesBackend(ExecutionBackend):
                     int(pod.metadata.labels[constants.JOB_INDEX_LABEL])
                 )
                 
-                # Keep only the most recently created Pod for each role
+                # Collect all Pods for this role
                 if role_key not in pods_by_role:
-                    pods_by_role[role_key] = pod
-                else:
-                    # Compare creation timestamps to keep the most recent
-                    current_pod = pods_by_role[role_key]
-                    if (pod.metadata.creation_timestamp and 
-                        current_pod.metadata.creation_timestamp and
-                        pod.metadata.creation_timestamp > current_pod.metadata.creation_timestamp):
-                        pods_by_role[role_key] = pod
+                    pods_by_role[role_key] = []
+                pods_by_role[role_key].append(pod)
 
-            # Process only the most recent Pod for each role
-            for role_key, pod in pods_by_role.items():
+            # Select the best Pod for each role using status-priority logic
+            selected_pods = {}
+            for role_key, pods in pods_by_role.items():
+                best_pod = self._select_best_pod_for_role(pods)
+                if best_pod:
+                    selected_pods[role_key] = best_pod
+
+            # Process only the selected Pod for each role
+            for role_key, pod in selected_pods.items():
                 replicated_job_name, job_index = role_key
                 
                 # Get the Initializer step.

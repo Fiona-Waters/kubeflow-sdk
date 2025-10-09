@@ -54,6 +54,15 @@ TRAINJOB_FAILED = "Failed"
 # The succeeded phase of the Pod.
 POD_SUCCEEDED = "Succeeded"
 
+# The running phase of the Pod.
+POD_RUNNING = "Running"
+
+# The failed phase of the Pod.
+POD_FAILED = "Failed"
+
+# The unknown phase of the Pod.
+POD_UNKNOWN = "Unknown"
+
 # The label key to identify the relationship between TrainJob and Pod template in the runtime.
 # For example, what PodTemplate must be overridden by TrainJob's .spec.trainer APIs.
 TRAINJOB_ANCESTOR_LABEL = "trainer.kubeflow.org/trainjob-ancestor-step"
