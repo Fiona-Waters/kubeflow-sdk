@@ -15,8 +15,7 @@
 
 # Import the Kubeflow Trainer client.
 from kubeflow.trainer.api.trainer_client import TrainerClient  # noqa: F401
-from kubeflow.trainer.backends.docker.types import LocalDockerBackendConfig
-from kubeflow.trainer.backends.podman.types import LocalPodmanBackendConfig
+from kubeflow.trainer.backends.container.types import ContainerBackendConfig
 
 # import backends and its associated configs
 from kubeflow.trainer.backends.kubernetes.types import KubernetesBackendConfig
@@ -60,7 +59,6 @@ __all__ = [
     "TrainerClient",
     "TrainerType",
     "LocalProcessBackendConfig",
-    "LocalDockerBackendConfig",
-    "LocalPodmanBackendConfig",
+    "ContainerBackendConfig",
     "KubernetesBackendConfig",
 ]
