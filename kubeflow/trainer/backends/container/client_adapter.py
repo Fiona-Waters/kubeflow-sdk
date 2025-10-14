@@ -148,6 +148,20 @@ class ContainerClientAdapter(abc.ABC):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def get_container_ip(self, container_id: str, network_id: str) -> str | None:
+        """
+        Get container's IP address on a specific network.
+
+        Args:
+            container_id: Container ID
+            network_id: Network name or ID
+
+        Returns:
+            IP address string or None if not found
+        """
+        raise NotImplementedError()
+
 
 class DockerClientAdapter(ContainerClientAdapter):
     """Adapter for Docker client."""
@@ -297,6 +311,29 @@ class DockerClientAdapter(ContainerClientAdapter):
             return (status, exit_code)
         except Exception:
             return ("unknown", None)
+
+    def get_container_ip(self, container_id: str, network_id: str) -> str | None:
+        """Get container's IP address on a specific network."""
+        try:
+            container = self.get_container(container_id)
+            # Refresh container info
+            container.reload()
+            # Get network settings
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+
+            # Try to find the network by exact name or ID
+            if network_id in networks:
+                return networks[network_id].get("IPAddress")
+
+            # Fallback: return first available IP
+            for net_name, net_info in networks.items():
+                ip = net_info.get("IPAddress")
+                if ip:
+                    return ip
+
+            return None
+        except Exception:
+            return None
 
 
 class PodmanClientAdapter(ContainerClientAdapter):
@@ -452,3 +489,27 @@ class PodmanClientAdapter(ContainerClientAdapter):
             return (status, exit_code)
         except Exception:
             return ("unknown", None)
+
+    def get_container_ip(self, container_id: str, network_id: str) -> str | None:
+        """Get container's IP address on a specific network."""
+        try:
+            container = self.get_container(container_id)
+            # Get container inspect data
+            inspect = container.attrs if hasattr(container, "attrs") else container.inspect()
+
+            # Get network settings - Podman structure is similar to Docker
+            networks = inspect.get("NetworkSettings", {}).get("Networks", {})
+
+            # Try to find the network by exact name or ID
+            if network_id in networks:
+                return networks[network_id].get("IPAddress")
+
+            # Fallback: return first available IP
+            for net_name, net_info in networks.items():
+                ip = net_info.get("IPAddress")
+                if ip:
+                    return ip
+
+            return None
+        except Exception:
+            return None
