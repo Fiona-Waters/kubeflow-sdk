@@ -221,13 +221,28 @@ class ContainerBackend(ExecutionBackend):
 
             # Create N containers (one per node)
             containers: list[_Node] = []
+            master_container_id = None
+            master_ip = None
 
             for rank in range(num_nodes):
                 container_name = f"{job_name}-node-{rank}"
 
                 # Get master address and port for torchrun
-                master_addr = f"{job_name}-node-0"
                 master_port = 29500
+
+                # For Podman: use IP address to avoid DNS timing issues
+                # For Docker: use hostname (DNS is reliable)
+                if rank == 0:
+                    # Master node - will be created first
+                    master_addr = f"{job_name}-node-0"
+                else:
+                    # Worker nodes - determine master address based on runtime
+                    if self._runtime_type == "podman" and master_ip:
+                        master_addr = master_ip
+                        logger.debug(f"Using master IP address for Podman: {master_ip}")
+                    else:
+                        master_addr = f"{job_name}-node-0"
+                        logger.debug(f"Using master hostname: {master_addr}")
 
                 # Prefer torchrun; fall back to python if torchrun is unavailable
                 # For worker nodes, wait for master to be reachable before starting torchrun
@@ -288,6 +303,20 @@ class ContainerBackend(ExecutionBackend):
 
                 logger.info(f"Started container {container_name} (ID: {container_id[:12]})")
                 containers.append(_Node(name=container_name, container_id=container_id))
+
+                # If this is the master node and we're using Podman, get its IP address
+                if rank == 0:
+                    master_container_id = container_id
+                    if self._runtime_type == "podman":
+                        # Get master IP for worker nodes to use
+                        master_ip = self._adapter.get_container_ip(master_container_id, network_id)
+                        if master_ip:
+                            logger.info(f"Master node IP address: {master_ip}")
+                        else:
+                            logger.warning(
+                                "Could not retrieve master IP address. "
+                                "Worker nodes will fall back to DNS resolution."
+                            )
 
             # Store job in backend
             self._jobs[job_name] = _Job(
