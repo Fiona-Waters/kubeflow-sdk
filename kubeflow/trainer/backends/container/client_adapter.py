@@ -162,6 +162,37 @@ class ContainerClientAdapter(abc.ABC):
         """
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def list_containers(self, filters: dict[str, str] | None = None) -> list[dict]:
+        """
+        List containers, optionally filtered by labels.
+
+        Args:
+            filters: Dictionary of filters (e.g., {"label": ["key=value"]})
+
+        Returns:
+            List of container info dictionaries with keys:
+            - id: Container ID
+            - name: Container name
+            - labels: Dictionary of labels
+            - status: Container status
+            - created: Creation timestamp
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_network(self, network_id: str) -> dict | None:
+        """
+        Get network information by ID or name.
+
+        Args:
+            network_id: Network ID or name
+
+        Returns:
+            Dictionary with network info including labels, or None if not found
+        """
+        raise NotImplementedError()
+
 
 class DockerClientAdapter(ContainerClientAdapter):
     """Adapter for Docker client."""
@@ -332,6 +363,35 @@ class DockerClientAdapter(ContainerClientAdapter):
                     return ip
 
             return None
+        except Exception:
+            return None
+
+    def list_containers(self, filters: dict[str, str] | None = None) -> list[dict]:
+        """List Docker containers with optional filters."""
+        try:
+            containers = self.client.containers.list(all=True, filters=filters)
+            result = []
+            for c in containers:
+                result.append({
+                    "id": c.id,
+                    "name": c.name,
+                    "labels": c.labels,
+                    "status": c.status,
+                    "created": c.attrs.get("Created", ""),
+                })
+            return result
+        except Exception:
+            return []
+
+    def get_network(self, network_id: str) -> dict | None:
+        """Get Docker network information."""
+        try:
+            network = self.client.networks.get(network_id)
+            return {
+                "id": network.id,
+                "name": network.name,
+                "labels": network.attrs.get("Labels", {}),
+            }
         except Exception:
             return None
 
@@ -511,5 +571,36 @@ class PodmanClientAdapter(ContainerClientAdapter):
                     return ip
 
             return None
+        except Exception:
+            return None
+
+    def list_containers(self, filters: dict[str, str] | None = None) -> list[dict]:
+        """List Podman containers with optional filters."""
+        try:
+            containers = self.client.containers.list(all=True, filters=filters)
+            result = []
+            for c in containers:
+                inspect = c.attrs if hasattr(c, "attrs") else c.inspect()
+                result.append({
+                    "id": c.id,
+                    "name": c.name,
+                    "labels": c.labels if hasattr(c, "labels") else inspect.get("Config", {}).get("Labels", {}),
+                    "status": c.status,
+                    "created": inspect.get("Created", ""),
+                })
+            return result
+        except Exception:
+            return []
+
+    def get_network(self, network_id: str) -> dict | None:
+        """Get Podman network information."""
+        try:
+            network = self.client.networks.get(network_id)
+            inspect = network.attrs if hasattr(network, "attrs") else network.inspect()
+            return {
+                "id": inspect.get("ID", network_id),
+                "name": inspect.get("Name", network_id),
+                "labels": inspect.get("Labels", {}),
+            }
         except Exception:
             return None
