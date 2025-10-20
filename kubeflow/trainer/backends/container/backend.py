@@ -39,7 +39,6 @@ Key behaviors:
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
 from datetime import datetime
 import logging
 import os
@@ -67,23 +66,6 @@ from kubeflow.trainer.types import types
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class _Node:
-    name: str
-    container_id: str
-    status: str = constants.TRAINJOB_CREATED
-
-
-@dataclass
-class _Job:
-    name: str
-    created: datetime
-    runtime: types.Runtime
-    network_id: str
-    nodes: list[_Node]
-    workdir_host: str
-
-
 class ContainerBackend(ExecutionBackend):
     """
     Unified container backend that auto-detects Docker or Podman.
@@ -94,7 +76,6 @@ class ContainerBackend(ExecutionBackend):
 
     def __init__(self, cfg: ContainerBackendConfig):
         self.cfg = cfg
-        self._jobs: dict[str, _Job] = {}
         self.label_prefix = "trainer.kubeflow.org"
 
         # Initialize the container client adapter
@@ -215,12 +196,17 @@ class ContainerBackend(ExecutionBackend):
 
             network_id = self._adapter.create_network(
                 name=f"{job_name}-net",
-                labels={f"{self.label_prefix}/trainjob-name": job_name},
+                labels={
+                    f"{self.label_prefix}/trainjob-name": job_name,
+                    f"{self.label_prefix}/runtime-name": runtime.name,
+                    f"{self.label_prefix}/workdir": workdir,
+                    f"{self.label_prefix}/created": datetime.now().isoformat(),
+                },
             )
             logger.info(f"Created network: {network_id}")
 
             # Create N containers (one per node)
-            containers: list[_Node] = []
+            container_ids: list[str] = []
             master_container_id = None
             master_ip = None
 
@@ -279,6 +265,8 @@ class ContainerBackend(ExecutionBackend):
                 labels = {
                     f"{self.label_prefix}/trainjob-name": job_name,
                     f"{self.label_prefix}/step": f"node-{rank}",
+                    f"{self.label_prefix}/network-id": network_id,
+                    f"{self.label_prefix}/num-nodes": str(num_nodes),
                 }
 
                 volumes = {
@@ -302,7 +290,7 @@ class ContainerBackend(ExecutionBackend):
                 )
 
                 logger.info(f"Started container {container_name} (ID: {container_id[:12]})")
-                containers.append(_Node(name=container_name, container_id=container_id))
+                container_ids.append(container_id)
 
                 # If this is the master node and we're using Podman, get its IP address
                 if rank == 0:
@@ -318,18 +306,8 @@ class ContainerBackend(ExecutionBackend):
                                 "Worker nodes will fall back to DNS resolution."
                             )
 
-            # Store job in backend
-            self._jobs[job_name] = _Job(
-                name=job_name,
-                created=datetime.now(),
-                runtime=runtime,
-                network_id=network_id,
-                nodes=containers,
-                workdir_host=workdir,
-            )
-
             logger.info(
-                f"Training job {job_name} created successfully with {len(containers)} container(s)"
+                f"Training job {job_name} created successfully with {len(container_ids)} container(s)"
             )
             return job_name
 
@@ -343,11 +321,11 @@ class ContainerBackend(ExecutionBackend):
 
             try:
                 # Stop and remove any containers that were created
-                if "containers" in locals():
-                    for node in containers:
+                if "container_ids" in locals():
+                    for container_id in container_ids:
                         with suppress(Exception):
-                            self._adapter.stop_container(node.container_id, timeout=5)
-                            self._adapter.remove_container(node.container_id, force=True)
+                            self._adapter.stop_container(container_id, timeout=5)
+                            self._adapter.remove_container(container_id, force=True)
 
                 # Remove network if it was created
                 if "network_id" in locals():
@@ -365,53 +343,146 @@ class ContainerBackend(ExecutionBackend):
             raise
 
     def list_jobs(self, runtime: types.Runtime | None = None) -> list[types.TrainJob]:
+        """List all training jobs by querying container runtime."""
+        # Get all containers with our label prefix
+        filters = {"label": [f"{self.label_prefix}/trainjob-name"]}
+        containers = self._adapter.list_containers(filters=filters)
+
+        # Group containers by job name
+        jobs_map: dict[str, list[dict]] = {}
+        for container in containers:
+            job_name = container["labels"].get(f"{self.label_prefix}/trainjob-name")
+            if job_name:
+                if job_name not in jobs_map:
+                    jobs_map[job_name] = []
+                jobs_map[job_name].append(container)
+
         result: list[types.TrainJob] = []
-        for job in self._jobs.values():
-            if runtime and job.runtime.name != runtime.name:
+        for job_name, job_containers in jobs_map.items():
+            # Get metadata from first container's network
+            if not job_containers:
                 continue
+
+            network_id = job_containers[0]["labels"].get(f"{self.label_prefix}/network-id")
+            if not network_id:
+                continue
+
+            network_info = self._adapter.get_network(network_id)
+            if not network_info:
+                continue
+
+            network_labels = network_info.get("labels", {})
+            runtime_name = network_labels.get(f"{self.label_prefix}/runtime-name")
+
+            # Filter by runtime if specified
+            if runtime and runtime_name != runtime.name:
+                continue
+
+            # Get runtime object
+            try:
+                job_runtime = self.get_runtime(runtime_name) if runtime_name else None
+            except Exception:
+                job_runtime = None
+
+            if not job_runtime:
+                continue
+
+            # Parse creation timestamp
+            created_str = network_labels.get(f"{self.label_prefix}/created", "")
+            try:
+                from dateutil import parser
+                creation_timestamp = parser.isoparse(created_str)
+            except Exception:
+                creation_timestamp = datetime.now()
+
+            # Build steps from containers
             steps = []
-            for node in job.nodes:
+            for container in sorted(job_containers, key=lambda c: c["name"]):
+                step_name = container["labels"].get(f"{self.label_prefix}/step", "")
                 steps.append(
                     types.Step(
-                        name=node.name.split(f"{job.name}-")[-1],
-                        pod_name=node.name,
-                        status=self._container_status(node.container_id),
+                        name=step_name,
+                        pod_name=container["name"],
+                        status=self._container_status(container["id"]),
                     )
                 )
+
+            # Get num_nodes from labels
+            num_nodes = int(job_containers[0]["labels"].get(f"{self.label_prefix}/num-nodes", len(job_containers)))
+
             result.append(
                 types.TrainJob(
-                    name=job.name,
-                    creation_timestamp=job.created,
-                    runtime=job.runtime,
+                    name=job_name,
+                    creation_timestamp=creation_timestamp,
+                    runtime=job_runtime,
                     steps=steps,
-                    num_nodes=len(job.nodes),
-                    status=self._aggregate_status(job),
+                    num_nodes=num_nodes,
+                    status=self._aggregate_status_from_containers(job_containers),
                 )
             )
+
         return result
 
     def get_job(self, name: str) -> types.TrainJob:
-        job = self._jobs.get(name)
-        if not job:
+        """Get a specific training job by querying container runtime."""
+        # Find containers for this job
+        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
+        containers = self._adapter.list_containers(filters=filters)
+
+        if not containers:
             raise ValueError(f"No TrainJob with name {name}")
-        # Refresh container statuses on demand
-        steps: list[types.Step] = []
-        for node in job.nodes:
-            status = self._container_status(node.container_id)
+
+        # Get metadata from network
+        network_id = containers[0]["labels"].get(f"{self.label_prefix}/network-id")
+        if not network_id:
+            raise ValueError(f"TrainJob {name} is missing network metadata")
+
+        network_info = self._adapter.get_network(network_id)
+        if not network_info:
+            raise ValueError(f"TrainJob {name} network not found")
+
+        network_labels = network_info.get("labels", {})
+        runtime_name = network_labels.get(f"{self.label_prefix}/runtime-name")
+
+        # Get runtime object
+        try:
+            job_runtime = self.get_runtime(runtime_name) if runtime_name else None
+        except Exception:
+            raise ValueError(f"Runtime {runtime_name} not found for job {name}")
+
+        if not job_runtime:
+            raise ValueError(f"Runtime {runtime_name} not found for job {name}")
+
+        # Parse creation timestamp
+        created_str = network_labels.get(f"{self.label_prefix}/created", "")
+        try:
+            from dateutil import parser
+            creation_timestamp = parser.isoparse(created_str)
+        except Exception:
+            creation_timestamp = datetime.now()
+
+        # Build steps from containers
+        steps = []
+        for container in sorted(containers, key=lambda c: c["name"]):
+            step_name = container["labels"].get(f"{self.label_prefix}/step", "")
             steps.append(
                 types.Step(
-                    name=node.name.split(f"{job.name}-")[-1],
-                    pod_name=node.name,
-                    status=status,
+                    name=step_name,
+                    pod_name=container["name"],
+                    status=self._container_status(container["id"]),
                 )
             )
+
+        # Get num_nodes from labels
+        num_nodes = int(containers[0]["labels"].get(f"{self.label_prefix}/num-nodes", len(containers)))
+
         return types.TrainJob(
-            name=job.name,
-            creation_timestamp=job.created,
-            runtime=job.runtime,
+            name=name,
+            creation_timestamp=creation_timestamp,
+            runtime=job_runtime,
             steps=steps,
-            num_nodes=len(job.nodes),
-            status=self._aggregate_status(job),
+            num_nodes=num_nodes,
+            status=self._aggregate_status_from_containers(containers),
         )
 
     def get_job_logs(
@@ -420,19 +491,23 @@ class ContainerBackend(ExecutionBackend):
         follow: bool = False,
         step: str = constants.NODE + "-0",
     ) -> Iterator[str]:
-        job = self._jobs.get(name)
-        if not job:
+        """Get logs for a training job by querying container runtime."""
+        # Find containers for this job
+        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
+        containers = self._adapter.list_containers(filters=filters)
+
+        if not containers:
             raise ValueError(f"No TrainJob with name {name}")
 
         want_all = step == constants.NODE + "-0"
-        for node in job.nodes:
-            node_step = node.name.split(f"{job.name}-")[-1]
-            if not want_all and node_step != step:
+        for container in sorted(containers, key=lambda c: c["name"]):
+            container_step = container["labels"].get(f"{self.label_prefix}/step", "")
+            if not want_all and container_step != step:
                 continue
             try:
-                yield from self._adapter.container_logs(node.container_id, follow)
+                yield from self._adapter.container_logs(container["id"], follow)
             except Exception as e:
-                logger.warning(f"Failed to get logs for {node.name}: {e}")
+                logger.warning(f"Failed to get logs for {container['name']}: {e}")
                 yield f"Error getting logs: {e}\n"
 
     def wait_for_job_status(
@@ -456,28 +531,42 @@ class ContainerBackend(ExecutionBackend):
         raise TimeoutError(f"Timeout waiting for TrainJob {name} to reach status: {status}")
 
     def delete_job(self, name: str):
-        job = self._jobs.get(name)
-        if not job:
+        """Delete a training job by querying container runtime."""
+        # Find containers for this job
+        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
+        containers = self._adapter.list_containers(filters=filters)
+
+        if not containers:
             raise ValueError(f"No TrainJob with name {name}")
+
+        # Get network_id and workdir from labels
+        network_id = containers[0]["labels"].get(f"{self.label_prefix}/network-id")
+
+        # Get workdir from network labels
+        workdir_host = None
+        if network_id:
+            network_info = self._adapter.get_network(network_id)
+            if network_info:
+                network_labels = network_info.get("labels", {})
+                workdir_host = network_labels.get(f"{self.label_prefix}/workdir")
 
         # Stop containers and remove
         from contextlib import suppress
 
-        for node in job.nodes:
+        for container in containers:
             with suppress(Exception):
-                self._adapter.stop_container(node.container_id, timeout=10)
+                self._adapter.stop_container(container["id"], timeout=10)
             with suppress(Exception):
-                self._adapter.remove_container(node.container_id, force=True)
+                self._adapter.remove_container(container["id"], force=True)
 
         # Remove network (best-effort)
-        with suppress(Exception):
-            self._adapter.delete_network(job.network_id)
+        if network_id:
+            with suppress(Exception):
+                self._adapter.delete_network(network_id)
 
         # Remove working directory if configured
-        if self.cfg.auto_remove and os.path.isdir(job.workdir_host):
-            shutil.rmtree(job.workdir_host, ignore_errors=True)
-
-        del self._jobs[name]
+        if self.cfg.auto_remove and workdir_host and os.path.isdir(workdir_host):
+            shutil.rmtree(workdir_host, ignore_errors=True)
 
     # Helper methods
 
@@ -572,9 +661,9 @@ class ContainerBackend(ExecutionBackend):
             return constants.UNKNOWN
         return constants.UNKNOWN
 
-    def _aggregate_status(self, job: _Job) -> str:
-        """Aggregate status from all containers in a job."""
-        statuses = [self._container_status(n.container_id) for n in job.nodes]
+    def _aggregate_status_from_containers(self, containers: list[dict]) -> str:
+        """Aggregate status from container info dicts."""
+        statuses = [self._container_status(c["id"]) for c in containers]
         if constants.TRAINJOB_FAILED in statuses:
             return constants.TRAINJOB_FAILED
         if constants.TRAINJOB_RUNNING in statuses:
