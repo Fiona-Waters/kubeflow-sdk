@@ -24,10 +24,11 @@ It provides a single interface regardless of the underlying container runtime.
 Key behaviors:
 - Auto-detection: Tries Docker first, then Podman. Can be overridden via config.
 - Multi-node jobs: one container per node connected via a per-job network.
-- Entry script generation: we serialize the user's training function to a small
-  Python file and invoke it inside the container using `torchrun` (preferred) or
-  `python` as a fallback.
-- Runtimes: we use `config/local_runtimes` to define runtime images and
+- Entry script generation: we serialize the user's training function and embed it
+  inline in the container command using a heredoc (no file I/O on the host). The
+  script is created inside the container at /tmp/train.py and invoked using
+  `torchrun` (preferred) or `python` as a fallback.
+- Runtimes: we use `config/training_runtimes` to define runtime images and
   characteristics (e.g., torch). Defaults to `torch-distributed` if no runtime
   is provided.
 - Image pulling: controlled via `pull_policy` and performed automatically if
@@ -42,22 +43,22 @@ from collections.abc import Iterator
 from datetime import datetime
 import logging
 import os
-from pathlib import Path
 import random
 import shutil
 import string
+from typing import Optional, Union
 import uuid
 
-from kubeflow.trainer.backends.base import ExecutionBackend
-from kubeflow.trainer.backends.container.client_adapter import (
-    ContainerClientAdapter,
-    DockerClientAdapter,
-    PodmanClientAdapter,
+from kubeflow.trainer.backends.base import RuntimeBackend
+from kubeflow.trainer.backends.container import utils as container_utils
+from kubeflow.trainer.backends.container.adapters.base import (
+    BaseContainerClientAdapter,
 )
+from kubeflow.trainer.backends.container.adapters.docker import DockerClientAdapter
+from kubeflow.trainer.backends.container.adapters.podman import PodmanClientAdapter
 from kubeflow.trainer.backends.container.runtime_loader import (
-    LOCAL_RUNTIMES_DIR,
-    get_local_runtime,
-    list_local_runtimes,
+    get_training_runtime_from_sources,
+    list_training_runtimes_from_sources,
 )
 from kubeflow.trainer.backends.container.types import ContainerBackendConfig
 from kubeflow.trainer.constants import constants
@@ -66,7 +67,7 @@ from kubeflow.trainer.types import types
 logger = logging.getLogger(__name__)
 
 
-class ContainerBackend(ExecutionBackend):
+class ContainerBackend(RuntimeBackend):
     """
     Unified container backend that auto-detects Docker or Podman.
 
@@ -81,7 +82,50 @@ class ContainerBackend(ExecutionBackend):
         # Initialize the container client adapter
         self._adapter = self._create_adapter()
 
-    def _create_adapter(self) -> ContainerClientAdapter:
+    def _get_common_socket_locations(self, runtime_name: str) -> list[Optional[str]]:
+        """
+        Get common socket locations to try for the given runtime.
+
+        Args:
+            runtime_name: "docker" or "podman"
+
+        Returns:
+            List of socket URLs to try, including None (for default)
+        """
+        import os
+        from pathlib import Path
+
+        locations = [self.cfg.container_host] if self.cfg.container_host else []
+
+        if runtime_name == "docker":
+            # Common Docker socket locations
+            colima_sock = Path.home() / ".colima/default/docker.sock"
+            if colima_sock.exists():
+                locations.append(f"unix://{colima_sock}")
+            # Standard Docker socket
+            locations.append(None)  # Use docker.from_env() default
+
+        elif runtime_name == "podman":
+            # Common Podman socket locations on macOS
+            uid = os.getuid() if hasattr(os, "getuid") else None
+            if uid:
+                user_sock = f"/run/user/{uid}/podman/podman.sock"
+                if Path(user_sock).exists():
+                    locations.append(f"unix://{user_sock}")
+            # Standard Podman socket
+            locations.append(None)  # Use PodmanClient() default
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_locations = []
+        for loc in locations:
+            if loc not in seen:
+                unique_locations.append(loc)
+                seen.add(loc)
+
+        return unique_locations
+
+    def _create_adapter(self) -> BaseContainerClientAdapter:
         """
         Create the appropriate container client adapter.
 
@@ -90,38 +134,67 @@ class ContainerBackend(ExecutionBackend):
 
         Raises RuntimeError if neither Docker nor Podman are available.
         """
-        if self.cfg.runtime:
-            # User specified a runtime explicitly
-            if self.cfg.runtime == "docker":
-                adapter = DockerClientAdapter(self.cfg.container_host)
-                adapter.ping()
-                logger.info("Using Docker as container runtime")
-                return adapter
-            elif self.cfg.runtime == "podman":
-                adapter = PodmanClientAdapter(self.cfg.container_host)
-                adapter.ping()
-                logger.info("Using Podman as container runtime")
-                return adapter
-        else:
-            # Auto-detect: try Docker first, then Podman
+        runtime_map = {
+            "docker": DockerClientAdapter,
+            "podman": PodmanClientAdapter,
+        }
+
+        # Determine which runtimes to try
+        runtimes_to_try = (
+            [self.cfg.container_runtime] if self.cfg.container_runtime else ["docker", "podman"]
+        )
+
+        last_error = None
+        for runtime_name in runtimes_to_try:
+            if runtime_name not in runtime_map:
+                continue
+
             try:
-                adapter = DockerClientAdapter(self.cfg.container_host)
+                adapter = runtime_map[runtime_name](self.cfg.container_host)
                 adapter.ping()
-                logger.info("Using Docker as container runtime")
+                logger.debug(f"Using {runtime_name} as container runtime")
                 return adapter
-            except Exception as docker_error:
-                logger.debug(f"Docker initialization failed: {docker_error}")
+            except Exception as e:
+                logger.debug(f"{runtime_name} initialization failed: {e}")
+                last_error = e
+
+            for host in socket_locations:
                 try:
-                    adapter = PodmanClientAdapter(self.cfg.container_host)
+                    adapter = runtime_map[runtime_name](host)
                     adapter.ping()
-                    logger.info("Using Podman as container runtime")
+                    host_display = host or "default"
+                    logger.debug(
+                        f"Using {runtime_name} as container runtime (host: {host_display})"
+                    )
                     return adapter
-                except Exception as podman_error:
-                    logger.debug(f"Podman initialization failed: {podman_error}")
-                    raise RuntimeError(
-                        "Neither Docker nor Podman is available. "
-                        "Please install Docker or Podman, or use LocalProcessBackendConfig instead."
-                    ) from podman_error
+                except Exception as e:
+                    host_str = host or "default"
+                    logger.debug(f"{runtime_name} initialization failed at {host_str}: {e}")
+                    attempted_connections.append(f"{runtime_name} at {host_str}")
+                    last_error = e
+
+        # Build helpful error message
+        import platform
+
+        system = platform.system()
+
+        attempted = ", ".join(attempted_connections)
+        error_msg = f"Could not connect to Docker or Podman (tried: {attempted}).\n"
+
+        if system == "Darwin":  # macOS
+            error_msg += (
+                "Ensure Docker/Podman is running "
+                "(e.g., 'colima start' or 'podman machine start').\n"
+            )
+        else:
+            error_msg += "Ensure Docker/Podman is installed and running.\n"
+
+        error_msg += (
+            "To specify a custom socket: ContainerBackendConfig(container_host='unix:///path/to/socket')\n"
+            "Or use LocalProcessBackendConfig for non-containerized execution."
+        )
+
+        raise RuntimeError(error_msg) from last_error
 
     @property
     def _runtime_type(self) -> str:
@@ -130,17 +203,17 @@ class ContainerBackend(ExecutionBackend):
 
     # ---- Runtime APIs ----
     def list_runtimes(self) -> list[types.Runtime]:
-        return list_local_runtimes()
+        return list_training_runtimes_from_sources(self.cfg.runtime_source.sources)
 
     def get_runtime(self, name: str) -> types.Runtime:
-        return get_local_runtime(name)
+        return get_training_runtime_from_sources(name, self.cfg.runtime_source.sources)
 
     def get_runtime_packages(self, runtime: types.Runtime):
         """
         Spawn a short-lived container to report Python version, pip list, and nvidia-smi.
         """
-        image = self._resolve_image(runtime)
-        self._maybe_pull_image(image)
+        image = container_utils.resolve_image(runtime)
+        container_utils.maybe_pull_image(self._adapter, image, self.cfg.pull_policy)
 
         command = [
             "bash",
@@ -155,9 +228,9 @@ class ContainerBackend(ExecutionBackend):
 
     def train(
         self,
-        runtime: types.Runtime | None = None,
-        initializer: types.Initializer | None = None,
-        trainer: types.CustomTrainer | types.BuiltinTrainer | None = None,
+        runtime: Optional[types.Runtime] = None,
+        initializer: Optional[types.Initializer] = None,
+        trainer: Optional[Union[types.CustomTrainer, types.BuiltinTrainer]] = None,
     ) -> str:
         if runtime is None:
             runtime = self.get_runtime("torch-distributed")
@@ -167,32 +240,49 @@ class ContainerBackend(ExecutionBackend):
 
         # Generate job name
         job_name = random.choice(string.ascii_lowercase) + uuid.uuid4().hex[:11]
-        logger.info(f"Starting training job: {job_name}")
+        logger.debug(f"Starting training job: {job_name}")
 
         try:
-            # Create per-job working directory on host
-            workdir = self._create_workdir(job_name)
+            # Create per-job working directory on host (for outputs, checkpoints, etc.)
+            workdir = container_utils.create_workdir(job_name)
             logger.debug(f"Created working directory: {workdir}")
 
-            _ = self._write_training_script(workdir, trainer)
-            logger.debug(f"Wrote training script to {workdir}/train.py")
+            # Generate training script code (inline, not written to disk)
+            training_script_code = container_utils.get_training_script_code(trainer)
+            logger.debug("Generated training script code")
 
             # Resolve image and pull if needed
-            image = self._resolve_image(runtime)
+            image = container_utils.resolve_image(runtime)
             logger.debug(f"Using image: {image}")
 
-            self._maybe_pull_image(image)
+            container_utils.maybe_pull_image(self._adapter, image, self.cfg.pull_policy)
             logger.debug(f"Image ready: {image}")
 
             # Build base environment
-            env = self._build_environment(trainer)
+            env = container_utils.build_environment(trainer)
 
             # Construct pre-run command to install packages
-            pre_install_cmd = self._build_pip_install_cmd(trainer)
+            pre_install_cmd = container_utils.build_pip_install_cmd(trainer)
 
             # Create network for multi-node communication
             num_nodes = trainer.num_nodes or runtime.trainer.num_nodes or 1
             logger.debug(f"Creating network for {num_nodes} nodes")
+
+            # Determine number of processes per node from GPU count
+            # For GPU training: spawn one process per GPU for optimal utilization
+            # For CPU training: use single process (PyTorch parallelizes internally via threads)
+            nproc_per_node = 1  # Default for CPU training
+            if trainer.resources_per_node and "gpu" in trainer.resources_per_node:
+                try:
+                    nproc_per_node = int(trainer.resources_per_node["gpu"])
+                    logger.debug(f"Using {nproc_per_node} processes per node (1 per GPU)")
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"Invalid GPU count in resources_per_node: "
+                        f"{trainer.resources_per_node['gpu']}, defaulting to 1 process per node"
+                    )
+            else:
+                logger.debug("No GPU specified, using 1 process per node")
 
             network_id = self._adapter.create_network(
                 name=f"{job_name}-net",
@@ -200,10 +290,9 @@ class ContainerBackend(ExecutionBackend):
                     f"{self.label_prefix}/trainjob-name": job_name,
                     f"{self.label_prefix}/runtime-name": runtime.name,
                     f"{self.label_prefix}/workdir": workdir,
-                    f"{self.label_prefix}/created": datetime.now().isoformat(),
                 },
             )
-            logger.info(f"Created network: {network_id}")
+            logger.debug(f"Created network: {network_id}")
 
             # Create N containers (one per node)
             container_ids: list[str] = []
@@ -247,16 +336,20 @@ class ContainerBackend(ExecutionBackend):
                         f"done; "
                     )
 
+                # Embed training script inline using heredoc (no file I/O on host)
                 entry_cmd = (
                     f"{pre_install_cmd}"
                     f"{wait_for_master}"
+                    f"cat > /tmp/train.py << 'TRAINING_SCRIPT_EOF'\n"
+                    f"{training_script_code}\n"
+                    f"TRAINING_SCRIPT_EOF\n"
                     "if command -v torchrun >/dev/null 2>&1; then "
-                    f"  torchrun --nproc_per_node=1 --nnodes={num_nodes} "
+                    f"  torchrun --nproc_per_node={nproc_per_node} --nnodes={num_nodes} "
                     f"  --node-rank={rank} --rdzv-backend=c10d "
                     f"  --rdzv-endpoint={master_addr}:{master_port} "
-                    f"  /workspace/train.py; "
+                    f"  /tmp/train.py; "
                     "else "
-                    f"  python /workspace/train.py; "
+                    f"  python /tmp/train.py; "
                     "fi"
                 )
 
@@ -266,12 +359,11 @@ class ContainerBackend(ExecutionBackend):
                     f"{self.label_prefix}/trainjob-name": job_name,
                     f"{self.label_prefix}/step": f"node-{rank}",
                     f"{self.label_prefix}/network-id": network_id,
-                    f"{self.label_prefix}/num-nodes": str(num_nodes),
                 }
 
                 volumes = {
                     workdir: {
-                        "bind": "/workspace",
+                        "bind": constants.WORKSPACE_PATH,
                         "mode": "rw",
                     }
                 }
@@ -286,10 +378,10 @@ class ContainerBackend(ExecutionBackend):
                     environment=env,
                     labels=labels,
                     volumes=volumes,
-                    working_dir="/workspace",
+                    working_dir=constants.WORKSPACE_PATH,
                 )
 
-                logger.info(f"Started container {container_name} (ID: {container_id[:12]})")
+                logger.debug(f"Started container {container_name} (ID: {container_id[:12]})")
                 container_ids.append(container_id)
 
                 # If this is the master node and we're using Podman, get its IP address
@@ -299,15 +391,16 @@ class ContainerBackend(ExecutionBackend):
                         # Get master IP for worker nodes to use
                         master_ip = self._adapter.get_container_ip(master_container_id, network_id)
                         if master_ip:
-                            logger.info(f"Master node IP address: {master_ip}")
+                            logger.debug(f"Master node IP address: {master_ip}")
                         else:
                             logger.warning(
                                 "Could not retrieve master IP address. "
                                 "Worker nodes will fall back to DNS resolution."
                             )
 
-            logger.info(
-                f"Training job {job_name} created successfully with {len(container_ids)} container(s)"
+            logger.debug(
+                f"Training job {job_name} created successfully with "
+                f"{len(container_ids)} container(s)"
             )
             return job_name
 
@@ -342,7 +435,101 @@ class ContainerBackend(ExecutionBackend):
             # Re-raise the original exception
             raise
 
-    def list_jobs(self, runtime: types.Runtime | None = None) -> list[types.TrainJob]:
+    def _get_job_containers(self, name: str) -> list[dict]:
+        """
+        Get containers for a specific training job.
+
+        Args:
+            name: Name of the training job
+
+        Returns:
+            List of container dictionaries for this job
+
+        Raises:
+            ValueError: If no containers found for the job
+        """
+        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
+        containers = self._adapter.list_containers(filters=filters)
+
+        if not containers:
+            raise ValueError(f"No TrainJob with name {name}")
+
+        return containers
+
+    def __get_trainjob_from_containers(
+        self, job_name: str, containers: list[dict]
+    ) -> types.TrainJob:
+        """
+        Build a TrainJob object from a list of containers.
+
+        Args:
+            job_name: Name of the training job
+            containers: List of container dictionaries for this job
+
+        Returns:
+            TrainJob object
+
+        Raises:
+            ValueError: If network metadata is missing or runtime not found
+        """
+        if not containers:
+            raise ValueError(f"No containers found for TrainJob {job_name}")
+
+        # Get metadata from network
+        network_id = containers[0]["labels"].get(f"{self.label_prefix}/network-id")
+        if not network_id:
+            raise ValueError(f"TrainJob {job_name} is missing network metadata")
+
+        network_info = self._adapter.get_network(network_id)
+        if not network_info:
+            raise ValueError(f"TrainJob {job_name} network not found")
+
+        network_labels = network_info.get("labels", {})
+        runtime_name = network_labels.get(f"{self.label_prefix}/runtime-name")
+
+        # Get runtime object
+        try:
+            job_runtime = self.get_runtime(runtime_name) if runtime_name else None
+        except Exception as e:
+            raise ValueError(f"Runtime {runtime_name} not found for job {job_name}") from e
+
+        if not job_runtime:
+            raise ValueError(f"Runtime {runtime_name} not found for job {job_name}")
+
+        # Parse creation timestamp from first container
+        created_str = containers[0].get("created", "")
+        try:
+            from dateutil import parser
+
+            creation_timestamp = parser.isoparse(created_str)
+        except Exception:
+            creation_timestamp = datetime.now()
+
+        # Build steps from containers
+        steps = []
+        for container in sorted(containers, key=lambda c: c["name"]):
+            step_name = container["labels"].get(f"{self.label_prefix}/step", "")
+            steps.append(
+                types.Step(
+                    name=step_name,
+                    pod_name=container["name"],
+                    status=container_utils.get_container_status(self._adapter, container["id"]),
+                )
+            )
+
+        # Get num_nodes from container count
+        num_nodes = len(containers)
+
+        return types.TrainJob(
+            name=job_name,
+            creation_timestamp=creation_timestamp,
+            runtime=job_runtime,
+            steps=steps,
+            num_nodes=num_nodes,
+            status=container_utils.aggregate_container_statuses(self._adapter, containers),
+        )
+
+    def list_jobs(self, runtime: Optional[types.Runtime] = None) -> list[types.TrainJob]:
         """List all training jobs by querying container runtime."""
         # Get all containers with our label prefix
         filters = {"label": [f"{self.label_prefix}/trainjob-name"]}
@@ -359,131 +546,34 @@ class ContainerBackend(ExecutionBackend):
 
         result: list[types.TrainJob] = []
         for job_name, job_containers in jobs_map.items():
-            # Get metadata from first container's network
+            # Skip jobs with no containers
             if not job_containers:
                 continue
 
-            network_id = job_containers[0]["labels"].get(f"{self.label_prefix}/network-id")
-            if not network_id:
-                continue
-
-            network_info = self._adapter.get_network(network_id)
-            if not network_info:
-                continue
-
-            network_labels = network_info.get("labels", {})
-            runtime_name = network_labels.get(f"{self.label_prefix}/runtime-name")
-
             # Filter by runtime if specified
-            if runtime and runtime_name != runtime.name:
-                continue
+            if runtime:
+                network_id = job_containers[0]["labels"].get(f"{self.label_prefix}/network-id")
+                if network_id:
+                    network_info = self._adapter.get_network(network_id)
+                    if network_info:
+                        network_labels = network_info.get("labels", {})
+                        runtime_name = network_labels.get(f"{self.label_prefix}/runtime-name")
+                        if runtime_name != runtime.name:
+                            continue
 
-            # Get runtime object
+            # Build TrainJob from containers
             try:
-                job_runtime = self.get_runtime(runtime_name) if runtime_name else None
-            except Exception:
-                job_runtime = None
-
-            if not job_runtime:
+                result.append(self.__get_trainjob_from_containers(job_name, job_containers))
+            except Exception as e:
+                logger.warning(f"Failed to get TrainJob {job_name}: {e}")
                 continue
-
-            # Parse creation timestamp
-            created_str = network_labels.get(f"{self.label_prefix}/created", "")
-            try:
-                from dateutil import parser
-                creation_timestamp = parser.isoparse(created_str)
-            except Exception:
-                creation_timestamp = datetime.now()
-
-            # Build steps from containers
-            steps = []
-            for container in sorted(job_containers, key=lambda c: c["name"]):
-                step_name = container["labels"].get(f"{self.label_prefix}/step", "")
-                steps.append(
-                    types.Step(
-                        name=step_name,
-                        pod_name=container["name"],
-                        status=self._container_status(container["id"]),
-                    )
-                )
-
-            # Get num_nodes from labels
-            num_nodes = int(job_containers[0]["labels"].get(f"{self.label_prefix}/num-nodes", len(job_containers)))
-
-            result.append(
-                types.TrainJob(
-                    name=job_name,
-                    creation_timestamp=creation_timestamp,
-                    runtime=job_runtime,
-                    steps=steps,
-                    num_nodes=num_nodes,
-                    status=self._aggregate_status_from_containers(job_containers),
-                )
-            )
 
         return result
 
     def get_job(self, name: str) -> types.TrainJob:
         """Get a specific training job by querying container runtime."""
-        # Find containers for this job
-        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
-        containers = self._adapter.list_containers(filters=filters)
-
-        if not containers:
-            raise ValueError(f"No TrainJob with name {name}")
-
-        # Get metadata from network
-        network_id = containers[0]["labels"].get(f"{self.label_prefix}/network-id")
-        if not network_id:
-            raise ValueError(f"TrainJob {name} is missing network metadata")
-
-        network_info = self._adapter.get_network(network_id)
-        if not network_info:
-            raise ValueError(f"TrainJob {name} network not found")
-
-        network_labels = network_info.get("labels", {})
-        runtime_name = network_labels.get(f"{self.label_prefix}/runtime-name")
-
-        # Get runtime object
-        try:
-            job_runtime = self.get_runtime(runtime_name) if runtime_name else None
-        except Exception:
-            raise ValueError(f"Runtime {runtime_name} not found for job {name}")
-
-        if not job_runtime:
-            raise ValueError(f"Runtime {runtime_name} not found for job {name}")
-
-        # Parse creation timestamp
-        created_str = network_labels.get(f"{self.label_prefix}/created", "")
-        try:
-            from dateutil import parser
-            creation_timestamp = parser.isoparse(created_str)
-        except Exception:
-            creation_timestamp = datetime.now()
-
-        # Build steps from containers
-        steps = []
-        for container in sorted(containers, key=lambda c: c["name"]):
-            step_name = container["labels"].get(f"{self.label_prefix}/step", "")
-            steps.append(
-                types.Step(
-                    name=step_name,
-                    pod_name=container["name"],
-                    status=self._container_status(container["id"]),
-                )
-            )
-
-        # Get num_nodes from labels
-        num_nodes = int(containers[0]["labels"].get(f"{self.label_prefix}/num-nodes", len(containers)))
-
-        return types.TrainJob(
-            name=name,
-            creation_timestamp=creation_timestamp,
-            runtime=job_runtime,
-            steps=steps,
-            num_nodes=num_nodes,
-            status=self._aggregate_status_from_containers(containers),
-        )
+        containers = self._get_job_containers(name)
+        return self.__get_trainjob_from_containers(name, containers)
 
     def get_job_logs(
         self,
@@ -492,12 +582,7 @@ class ContainerBackend(ExecutionBackend):
         step: str = constants.NODE + "-0",
     ) -> Iterator[str]:
         """Get logs for a training job by querying container runtime."""
-        # Find containers for this job
-        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
-        containers = self._adapter.list_containers(filters=filters)
-
-        if not containers:
-            raise ValueError(f"No TrainJob with name {name}")
+        containers = self._get_job_containers(name)
 
         want_all = step == constants.NODE + "-0"
         for container in sorted(containers, key=lambda c: c["name"]):
@@ -532,12 +617,7 @@ class ContainerBackend(ExecutionBackend):
 
     def delete_job(self, name: str):
         """Delete a training job by querying container runtime."""
-        # Find containers for this job
-        filters = {"label": [f"{self.label_prefix}/trainjob-name={name}"]}
-        containers = self._adapter.list_containers(filters=filters)
-
-        if not containers:
-            raise ValueError(f"No TrainJob with name {name}")
+        containers = self._get_job_containers(name)
 
         # Get network_id and workdir from labels
         network_id = containers[0]["labels"].get(f"{self.label_prefix}/network-id")
@@ -567,150 +647,3 @@ class ContainerBackend(ExecutionBackend):
         # Remove working directory if configured
         if self.cfg.auto_remove and workdir_host and os.path.isdir(workdir_host):
             shutil.rmtree(workdir_host, ignore_errors=True)
-
-    # Helper methods
-
-    def _create_workdir(self, job_name: str) -> str:
-        """Create per-job working directory on host."""
-        workdir_base = self.cfg.workdir_base
-        if workdir_base:
-            base = Path(workdir_base)
-            base.mkdir(parents=True, exist_ok=True)
-            workdir = str((base / f"{job_name}").resolve())
-            os.makedirs(workdir, exist_ok=True)
-        else:
-            backend_name = (
-                self.__class__.__name__.lower().replace("local", "").replace("backend", "")
-            )
-            home_base = Path.home() / ".kubeflow_trainer" / f"local{backend_name}"
-            home_base.mkdir(parents=True, exist_ok=True)
-            workdir = str((home_base / f"{job_name}").resolve())
-            os.makedirs(workdir, exist_ok=True)
-        return workdir
-
-    def _write_training_script(self, workdir: str, trainer: types.CustomTrainer) -> Path:
-        """Write the training script to the working directory."""
-        script_path = Path(workdir) / "train.py"
-        import inspect
-        import textwrap
-
-        code = inspect.getsource(trainer.func)
-        code = textwrap.dedent(code)
-        if trainer.func_args is None:
-            code += f"\n{trainer.func.__name__}()\n"
-        else:
-            code += f"\n{trainer.func.__name__}({trainer.func_args})\n"
-        script_path.write_text(code)
-        return script_path
-
-    def _build_environment(self, trainer: types.CustomTrainer) -> dict[str, str]:
-        """Build environment variables for containers."""
-        env = dict(self.cfg.env or {})
-        if trainer.env:
-            env.update(trainer.env)
-        return env
-
-    def _build_pip_install_cmd(self, trainer: types.CustomTrainer) -> str:
-        """Build pip install command for packages."""
-        pkgs = trainer.packages_to_install or []
-        if not pkgs:
-            return ""
-
-        index_urls = trainer.pip_index_urls or list(constants.DEFAULT_PIP_INDEX_URLS)
-        main_idx = index_urls[0]
-        extras = " ".join(f"--extra-index-url {u}" for u in index_urls[1:])
-        quoted = " ".join(f'"{p}"' for p in pkgs)
-        return (
-            "PIP_DISABLE_PIP_VERSION_CHECK=1 pip install --no-warn-script-location "
-            f"--index-url {main_idx} {extras} {quoted} && "
-        )
-
-    def _maybe_pull_image(self, image: str):
-        """Pull image based on pull policy."""
-        policy = (self.cfg.pull_policy or "IfNotPresent").lower()
-        try:
-            if policy == "never":
-                if not self._adapter.image_exists(image):
-                    raise RuntimeError(
-                        f"Image '{image}' not found locally and pull policy is Never"
-                    )
-                return
-            if policy == "always":
-                logger.debug(f"Pulling image (Always): {image}")
-                self._adapter.pull_image(image)
-                return
-            # IfNotPresent
-            if not self._adapter.image_exists(image):
-                logger.debug(f"Pulling image (IfNotPresent): {image}")
-                self._adapter.pull_image(image)
-        except Exception as e:
-            raise RuntimeError(f"Failed to ensure image '{image}': {e}") from e
-
-    def _container_status(self, container_id: str) -> str:
-        """Get the status of a container."""
-        try:
-            status, exit_code = self._adapter.container_status(container_id)
-            if status == "running":
-                return constants.TRAINJOB_RUNNING
-            if status == "created":
-                return constants.TRAINJOB_CREATED
-            if status == "exited":
-                # Exit code 0 -> complete, else failed
-                return constants.TRAINJOB_COMPLETE if exit_code == 0 else constants.TRAINJOB_FAILED
-        except Exception:
-            return constants.UNKNOWN
-        return constants.UNKNOWN
-
-    def _aggregate_status_from_containers(self, containers: list[dict]) -> str:
-        """Aggregate status from container info dicts."""
-        statuses = [self._container_status(c["id"]) for c in containers]
-        if constants.TRAINJOB_FAILED in statuses:
-            return constants.TRAINJOB_FAILED
-        if constants.TRAINJOB_RUNNING in statuses:
-            return constants.TRAINJOB_RUNNING
-        if all(s == constants.TRAINJOB_COMPLETE for s in statuses if s != constants.UNKNOWN):
-            return constants.TRAINJOB_COMPLETE
-        if any(s == constants.TRAINJOB_CREATED for s in statuses):
-            return constants.TRAINJOB_CREATED
-        return constants.UNKNOWN
-
-    def _resolve_image(self, runtime: types.Runtime) -> str:
-        """Resolve the container image for a runtime."""
-        if self.cfg.image:
-            return self.cfg.image
-
-        import yaml
-
-        for f in sorted(LOCAL_RUNTIMES_DIR.glob("*.yaml")):
-            try:
-                data = yaml.safe_load(Path(f).read_text())
-                if (
-                    data.get("kind") in {"ClusterTrainingRuntime", "TrainingRuntime"}
-                    and data.get("metadata", {}).get("name") == runtime.name
-                ):
-                    replicated = (
-                        data.get("spec", {})
-                        .get("template", {})
-                        .get("spec", {})
-                        .get("replicatedJobs", [])
-                    )
-                    node_jobs = [j for j in replicated if j.get("name") == "node"]
-                    if node_jobs:
-                        node_spec = (
-                            node_jobs[0]
-                            .get("template", {})
-                            .get("spec", {})
-                            .get("template", {})
-                            .get("spec", {})
-                        )
-                        containers = node_spec.get("containers", [])
-                        if containers and containers[0].get("image"):
-                            return str(containers[0]["image"])
-            except Exception:
-                continue
-
-        raise ValueError(
-            f"No image specified for runtime '{runtime.name}'. "
-            f"Provide ContainerBackendConfig.image or add an 'image' field "
-            f"to its YAML in {LOCAL_RUNTIMES_DIR}."
-        )

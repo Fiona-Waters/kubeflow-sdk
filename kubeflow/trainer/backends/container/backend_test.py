@@ -19,16 +19,20 @@ Tests the ContainerBackend class with mocked container adapters.
 """
 
 from collections.abc import Iterator
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import pytest
 
+from kubeflow.trainer.backends.container.adapters.base import (
+    BaseContainerClientAdapter,
+)
 from kubeflow.trainer.backends.container.backend import ContainerBackend
-from kubeflow.trainer.backends.container.client_adapter import ContainerClientAdapter
 from kubeflow.trainer.backends.container.types import ContainerBackendConfig
 from kubeflow.trainer.constants import constants
 from kubeflow.trainer.test.common import FAILED, SUCCESS, TestCase
@@ -36,7 +40,7 @@ from kubeflow.trainer.types import types
 
 
 # Mock Container Adapter
-class MockContainerAdapter(ContainerClientAdapter):
+class MockContainerAdapter(BaseContainerClientAdapter):
     """Mock adapter for testing ContainerBackend without Docker/Podman."""
 
     def __init__(self):
@@ -121,27 +125,87 @@ class MockContainerAdapter(ContainerClientAdapter):
     def run_oneoff_container(self, image: str, command: list[str]) -> str:
         return "Python 3.9.0\npip 21.0.1\nnvidia-smi not found\n"
 
-    def container_status(self, container_id: str) -> tuple[str, int | None]:
+    def container_status(self, container_id: str) -> tuple[str, Optional[int]]:
         for container in self.containers_created:
             if container["id"] == container_id:
                 return (container["status"], container.get("exit_code"))
         return ("unknown", None)
 
-    def set_container_status(self, container_id: str, status: str, exit_code: int | None = None):
+    def set_container_status(self, container_id: str, status: str, exit_code: Optional[int] = None):
         """Helper method to set container status for testing."""
         for container in self.containers_created:
             if container["id"] == container_id:
                 container["status"] = status
                 container["exit_code"] = exit_code
 
+    def get_container_ip(self, container_id: str, network_id: str) -> Optional[str]:
+        """Get container IP address on a specific network."""
+        for container in self.containers_created:
+            if container["id"] == container_id:
+                return f"192.168.1.{len(self.containers_created)}"
+        return None
+
+    def list_containers(self, filters: Optional[dict[str, list[str]]] = None) -> list[dict]:
+        """List containers with optional filters."""
+        if not filters:
+            return [
+                {
+                    "id": c["id"],
+                    "name": c["name"],
+                    "labels": c["labels"],
+                    "status": c["status"],
+                    "created": "2025-01-01T00:00:00Z",
+                }
+                for c in self.containers_created
+            ]
+
+        # Simple label filtering
+        result = []
+        for container in self.containers_created:
+            if "label" in filters:
+                match = True
+                for label_filter in filters["label"]:
+                    if "=" in label_filter:
+                        key, value = label_filter.split("=", 1)
+                        if container["labels"].get(key) != value:
+                            match = False
+                            break
+                    else:
+                        if label_filter not in container["labels"]:
+                            match = False
+                            break
+                if match:
+                    result.append(
+                        {
+                            "id": container["id"],
+                            "name": container["name"],
+                            "labels": container["labels"],
+                            "status": container["status"],
+                            "created": "2025-01-01T00:00:00Z",
+                        }
+                    )
+        return result
+
+    def get_network(self, network_id: str) -> Optional[dict]:
+        """Get network information."""
+        for network in self.networks_created:
+            if network["id"] == network_id or network["name"] == network_id:
+                return {
+                    "id": network["id"],
+                    "name": network["name"],
+                    "labels": network["labels"],
+                }
+        return None
+
 
 # Fixtures
 @pytest.fixture
 def container_backend():
     """Provide ContainerBackend with mocked adapter."""
-    backend = ContainerBackend(ContainerBackendConfig())
-    backend._adapter = MockContainerAdapter()
-    return backend
+    with patch("kubeflow.trainer.backends.container.backend.DockerClientAdapter") as mock_docker:
+        mock_docker.return_value = MockContainerAdapter()
+        backend = ContainerBackend(ContainerBackendConfig())
+        return backend
 
 
 @pytest.fixture
@@ -196,7 +260,8 @@ def test_backend_initialization(test_case):
 
                 _ = ContainerBackend(ContainerBackendConfig())
 
-                mock_docker.assert_called_once_with(None)
+                # Docker should be called (could be with Colima socket or None)
+                assert mock_docker.call_count == 1
                 mock_docker_instance.ping.assert_called_once()
                 mock_podman.assert_not_called()
                 assert test_case.expected_status == SUCCESS
@@ -219,7 +284,8 @@ def test_backend_initialization(test_case):
 
                 _ = ContainerBackend(ContainerBackendConfig())
 
-                mock_docker.assert_called_once()
+                # Docker may be tried multiple times (different socket locations)
+                assert mock_docker.call_count >= 1
                 mock_podman.assert_called_once_with(None)
                 mock_podman_instance.ping.assert_called_once()
                 assert test_case.expected_status == SUCCESS
@@ -334,6 +400,46 @@ def test_get_runtime_packages(container_backend):
                 "expected_containers": 1,
             },
         ),
+        TestCase(
+            name="train with single GPU",
+            expected_status=SUCCESS,
+            config={
+                "num_nodes": 1,
+                "resources_per_node": {"gpu": "1"},
+                "expected_containers": 1,
+                "expected_nproc_per_node": 1,
+            },
+        ),
+        TestCase(
+            name="train with multiple GPUs",
+            expected_status=SUCCESS,
+            config={
+                "num_nodes": 1,
+                "resources_per_node": {"gpu": "4"},
+                "expected_containers": 1,
+                "expected_nproc_per_node": 4,
+            },
+        ),
+        TestCase(
+            name="train multi-node with GPUs",
+            expected_status=SUCCESS,
+            config={
+                "num_nodes": 2,
+                "resources_per_node": {"gpu": "2"},
+                "expected_containers": 2,
+                "expected_nproc_per_node": 2,
+            },
+        ),
+        TestCase(
+            name="train with CPU resources (nproc=1)",
+            expected_status=SUCCESS,
+            config={
+                "num_nodes": 1,
+                "resources_per_node": {"cpu": "16"},
+                "expected_containers": 1,
+                "expected_nproc_per_node": 1,
+            },
+        ),
     ],
 )
 def test_train(container_backend, test_case):
@@ -345,6 +451,7 @@ def test_train(container_backend, test_case):
             num_nodes=test_case.config.get("num_nodes", 1),
             env=test_case.config.get("env"),
             packages_to_install=test_case.config.get("packages"),
+            resources_per_node=test_case.config.get("resources_per_node"),
         )
         runtime = container_backend.get_runtime("torch-distributed")
 
@@ -372,6 +479,15 @@ def test_train(container_backend, test_case):
             assert "pip install" in command_str
             for package in test_case.config["packages"]:
                 assert package in command_str
+
+        # Check nproc_per_node if specified
+        if "expected_nproc_per_node" in test_case.config:
+            container = container_backend._adapter.containers_created[0]
+            command_str = container["command"][2]  # Get bash script content
+            expected_nproc = test_case.config["expected_nproc_per_node"]
+            assert f"--nproc_per_node={expected_nproc}" in command_str, (
+                f"Expected --nproc_per_node={expected_nproc} in command, but got: {command_str}"
+            )
 
     except Exception as e:
         assert type(e) is test_case.expected_error
@@ -583,7 +699,6 @@ def test_delete_job(container_backend, temp_workdir, test_case):
     """Test deleting a job."""
     print("Executing test:", test_case.name)
     try:
-        container_backend.cfg.workdir_base = temp_workdir
         container_backend.cfg.auto_remove = test_case.config["auto_remove"]
 
         trainer = types.CustomTrainer(
@@ -592,7 +707,7 @@ def test_delete_job(container_backend, temp_workdir, test_case):
         runtime = container_backend.get_runtime("torch-distributed")
         job_name = container_backend.train(runtime=runtime, trainer=trainer)
 
-        job_workdir = Path(temp_workdir) / job_name
+        job_workdir = Path.home() / ".kubeflow" / "trainer" / "containers" / job_name
         assert job_workdir.exists()
 
         container_backend.delete_job(job_name)
@@ -665,3 +780,84 @@ def test_container_status_mapping(container_backend, test_case):
     except Exception as e:
         assert type(e) is test_case.expected_error
     print("test execution complete")
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        TestCase(
+            name="docker socket locations with colima",
+            expected_status=SUCCESS,
+            config={
+                "runtime_name": "docker",
+                "container_host": None,
+                "create_colima_socket": True,
+                "expected_contains_none": True,
+                "expected_has_colima": True,
+            },
+        ),
+        TestCase(
+            name="custom host has priority",
+            expected_status=SUCCESS,
+            config={
+                "runtime_name": "docker",
+                "container_host": "unix:///custom/path/docker.sock",
+                "create_colima_socket": False,
+                "expected_first": "unix:///custom/path/docker.sock",
+            },
+        ),
+    ],
+)
+def test_get_common_socket_locations(test_case, tmp_path):
+    """Test common socket location detection."""
+    print("Executing test:", test_case.name)
+
+    # Setup
+    if test_case.config.get("create_colima_socket"):
+        colima_dir = tmp_path / ".colima" / "default"
+        colima_dir.mkdir(parents=True)
+        colima_sock = colima_dir / "docker.sock"
+        colima_sock.touch()
+
+    cfg = ContainerBackendConfig(container_host=test_case.config["container_host"])
+
+    # Test the method directly without creating the backend
+    context_manager = (
+        patch("pathlib.Path.home", return_value=tmp_path)
+        if test_case.config.get("create_colima_socket")
+        else nullcontext()
+    )
+
+    with context_manager:
+        backend = ContainerBackend.__new__(ContainerBackend)
+        backend.cfg = cfg
+        locations = backend._get_common_socket_locations(test_case.config["runtime_name"])
+
+        # Assertions
+        if "expected_contains_none" in test_case.config:
+            assert None in locations
+
+        if "expected_has_colima" in test_case.config:
+            assert f"unix://{colima_sock}" in locations
+
+        if "expected_first" in test_case.config:
+            assert locations[0] == test_case.config["expected_first"]
+
+    print("test execution complete")
+
+
+def test_create_adapter_error_message_format():
+    """Test that error message includes attempted connections."""
+    cfg = ContainerBackendConfig(container_runtime="docker")
+
+    docker_adapter = "kubeflow.trainer.backends.container.adapters.docker.DockerClientAdapter"
+    with patch(docker_adapter) as mock_docker:
+        mock_docker.side_effect = Exception("Connection failed")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            ContainerBackend(cfg)
+
+        # Error message should be helpful
+        error_msg = str(exc_info.value)
+        assert "Could not connect" in error_msg
+        assert "tried:" in error_msg

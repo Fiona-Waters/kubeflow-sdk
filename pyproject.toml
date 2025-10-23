@@ -108,7 +108,9 @@ select = [
 ]
 
 ignore = [
-  "B006", # mutable-argument-default
+  "B006",  # mutable-argument-default
+  "UP007", # Use X | Y instead of Union[X, Y] (requires Python 3.10+)
+  "UP045", # Use X | None instead of Optional[X] (requires Python 3.10+)
 ]
 
 

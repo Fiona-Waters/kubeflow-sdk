@@ -162,3 +162,8 @@ TORCH_TUNE_COMMAND = ("tune", "run")
 
 # The Instruct Datasets class in torchtune
 TORCH_TUNE_INSTRUCT_DATASET = "torchtune.datasets.instruct_dataset"
+
+# Default container images for each framework (used as fallback when runtime not provided)
+DEFAULT_FRAMEWORK_IMAGES = {
+    "torch": "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime",
+}

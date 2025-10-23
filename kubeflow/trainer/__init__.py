@@ -15,12 +15,13 @@
 
 # Import common types.
 from kubeflow.common.types import KubernetesBackendConfig
-# Import the Kubeflow Trainer client.
-from kubeflow.trainer.api.trainer_client import TrainerClient  # noqa: F401
-from kubeflow.trainer.backends.container.types import ContainerBackendConfig
 
 # Import the Kubeflow Trainer client.
 from kubeflow.trainer.api.trainer_client import TrainerClient
+from kubeflow.trainer.backends.container.types import (
+    ContainerBackendConfig,
+    TrainingRuntimeSource,
+)
 from kubeflow.trainer.backends.localprocess.types import LocalProcessBackendConfig
 
 # Import the Kubeflow Trainer constants.
@@ -69,4 +70,5 @@ __all__ = [
     "LocalProcessBackendConfig",
     "ContainerBackendConfig",
     "KubernetesBackendConfig",
+    "TrainingRuntimeSource",
 ]

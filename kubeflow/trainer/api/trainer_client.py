@@ -16,6 +16,7 @@ from collections.abc import Iterator
 import logging
 from typing import Optional, Union
 
+from kubeflow.common.types import KubernetesBackendConfig
 from kubeflow.trainer.backends.container.backend import ContainerBackend
 from kubeflow.trainer.backends.container.types import ContainerBackendConfig
 from kubeflow.trainer.backends.kubernetes.backend import KubernetesBackend

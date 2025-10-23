@@ -73,38 +73,24 @@ print("\n".join(TrainerClient().get_job_logs(name=job_id)))
 
 ## Local Development
 
-Kubeflow SDK provides first-class support for local development, allowing you to test and iterate on your models without needing a Kubernetes cluster.
+Kubeflow Trainer client supports local development without needing a Kubernetes cluster.
 
-### Execution Backends
+### Available Backends
 
-Choose the backend that fits your development workflow:
+- **KubernetesBackend** (default) - Production training on Kubernetes
+- **ContainerBackend** - Local development with Docker/Podman isolation  
+- **LocalProcessBackend** - Quick prototyping with Python subprocesses
 
-| Backend | Description | Use Case |
-|---------|-------------|----------|
-| **KubernetesBackend** | Run jobs on Kubernetes cluster | Production, multi-node distributed training |
-| **ContainerBackend** | Auto-detects Docker or Podman | Local development with container isolation |
-| **LocalProcessBackend** | Run as local Python subprocesses | Quick prototyping, debugging |
-
-### Local Container Execution
-
-The **ContainerBackend** automatically detects and uses either Docker or Podman:
-
-```bash
-# Install with Docker support
-pip install kubeflow[docker]
-
-# Or install with Podman support
-pip install kubeflow[podman]
-```
+**Quick Start:**
+Install container support: `pip install kubeflow[docker]` or `pip install kubeflow[podman]`
 
 ```python
 from kubeflow.trainer import TrainerClient, ContainerBackendConfig, CustomTrainer
 
-# Auto-detects Docker or Podman
-config = ContainerBackendConfig()
-client = TrainerClient(backend_config=config)
+# Switch to local container execution
+client = TrainerClient(backend_config=ContainerBackendConfig())
 
-# Your training runs in isolated containers
+# Your training runs locally in isolated containers
 job_id = client.train(trainer=CustomTrainer(func=train_fn))
 ```
 
