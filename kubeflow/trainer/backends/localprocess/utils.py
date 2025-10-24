@@ -259,6 +259,40 @@ def get_local_train_job_script(
     if not python_bin:
         raise ValueError("No python executable found")
 
+    # If python_bin is a pyenv shim, resolve it to the actual Python executable
+    # by running it with sys.executable to get the real path
+    if ".pyenv/shims" in python_bin:
+        import subprocess
+        try:
+            # Use the shim to find the actual Python executable
+            result = subprocess.run(
+                [python_bin, "-c", "import sys; print(sys.executable)"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            actual_python = result.stdout.strip()
+            if actual_python and Path(actual_python).exists():
+                python_bin = actual_python
+        except subprocess.CalledProcessError:
+            # If the shim fails (e.g., 'python' not configured in pyenv),
+            # try 'python3' instead
+            python3_bin = shutil.which("python3")
+            if python3_bin and python3_bin != python_bin:
+                try:
+                    result = subprocess.run(
+                        [python3_bin, "-c", "import sys; print(sys.executable)"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    actual_python = result.stdout.strip()
+                    if actual_python and Path(actual_python).exists():
+                        python_bin = actual_python
+                except subprocess.CalledProcessError:
+                    # If both fail, keep the original
+                    pass
+
     # workout if dependencies needs to be installed
     if isinstance(runtime.trainer, LocalRuntimeTrainer):
         runtime_trainer: LocalRuntimeTrainer = runtime.trainer
