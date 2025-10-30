@@ -130,7 +130,8 @@ class ContainerBackend(RuntimeBackend):
         Create the appropriate container client adapter.
 
         Tries Docker first, then Podman if Docker fails, unless a specific
-        runtime is requested in the config.
+        runtime is requested in the config. Automatically tries common socket
+        locations (e.g., Colima for Docker on macOS, user socket for Podman).
 
         Raises RuntimeError if neither Docker nor Podman are available.
         """
@@ -144,19 +145,15 @@ class ContainerBackend(RuntimeBackend):
             [self.cfg.container_runtime] if self.cfg.container_runtime else ["docker", "podman"]
         )
 
+        attempted_connections = []
         last_error = None
+
         for runtime_name in runtimes_to_try:
             if runtime_name not in runtime_map:
                 continue
 
-            try:
-                adapter = runtime_map[runtime_name](self.cfg.container_host)
-                adapter.ping()
-                logger.debug(f"Using {runtime_name} as container runtime")
-                return adapter
-            except Exception as e:
-                logger.debug(f"{runtime_name} initialization failed: {e}")
-                last_error = e
+            # Try common socket locations for this runtime
+            socket_locations = self._get_common_socket_locations(runtime_name)
 
             for host in socket_locations:
                 try:

@@ -94,8 +94,6 @@ client = TrainerClient(backend_config=ContainerBackendConfig())
 job_id = client.train(trainer=CustomTrainer(func=train_fn))
 ```
 
-For detailed configuration options and platform-specific setup (macOS, Linux), see the [ContainerBackend documentation](kubeflow/trainer/backends/container/README.md).
-
 ## Supported Kubeflow Projects
 
 | Project                     | Status           | Version Support | Description                                                          |
