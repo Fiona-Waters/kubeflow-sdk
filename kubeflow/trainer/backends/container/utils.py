@@ -152,7 +152,11 @@ def aggregate_status_from_containers(container_statuses: list[str]) -> str:
 
 def resolve_image(runtime: types.Runtime) -> str:
     """
-    Resolve the container image for a runtime from DEFAULT_FRAMEWORK_IMAGES.
+    Resolve the container image for a runtime.
+
+    Priority:
+    1. Use runtime.image if specified in the ClusterTrainingRuntime
+    2. Fall back to DEFAULT_FRAMEWORK_IMAGES based on framework
 
     Args:
         runtime: Runtime object.
@@ -163,6 +167,11 @@ def resolve_image(runtime: types.Runtime) -> str:
     Raises:
         ValueError: If no image is found for the runtime's framework.
     """
+    # Use image from runtime if specified
+    if runtime.image:
+        return runtime.image
+
+    # Fall back to default framework images
     framework = runtime.trainer.framework
     if framework in constants.DEFAULT_FRAMEWORK_IMAGES:
         return constants.DEFAULT_FRAMEWORK_IMAGES[framework]

@@ -357,6 +357,8 @@ def test_create_default_runtimes():
     assert torch_runtimes[0].name == "torch-distributed"
     assert torch_runtimes[0].trainer.trainer_type == base_types.TrainerType.CUSTOM_TRAINER
     assert torch_runtimes[0].trainer.num_nodes == 1
+    # Verify default image is set
+    assert torch_runtimes[0].image == constants.DEFAULT_FRAMEWORK_IMAGES["torch"]
     print("test execution complete")
 
 
@@ -518,6 +520,172 @@ def test_fetch_runtime_from_github(test_case):
                     assert "raw.githubusercontent.com" in called_url
                     assert f"{kwargs['owner']}/{kwargs['repo']}" in called_url
                     assert f"{kwargs['path']}/{kwargs['runtime_file']}" in called_url
+
+        assert test_case.expected_status == SUCCESS
+
+    except Exception as e:
+        assert type(e) is test_case.expected_error
+    print("test execution complete")
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        TestCase(
+            name="parse runtime yaml with custom image",
+            expected_status=SUCCESS,
+            config={
+                "custom_image": "quay.io/custom/pytorch-arm:v1.0",
+                "runtime_name": "torch-arm",
+                "framework": "torch",
+                "num_nodes": 2,
+            },
+        ),
+        TestCase(
+            name="parse runtime yaml with different custom image",
+            expected_status=SUCCESS,
+            config={
+                "custom_image": "my-registry.io/pytorch:gpu-arm64",
+                "runtime_name": "torch-gpu-arm",
+                "framework": "torch",
+                "num_nodes": 4,
+            },
+        ),
+        TestCase(
+            name="parse runtime yaml prefers container named node",
+            expected_status=SUCCESS,
+            config={
+                "custom_image": "correct-node-image:v1.0",
+                "runtime_name": "multi-container-runtime",
+                "framework": "torch",
+                "num_nodes": 1,
+                "multiple_containers": True,
+            },
+        ),
+    ],
+)
+def test_parse_runtime_yaml_extracts_image(test_case):
+    """
+    Test that _parse_runtime_yaml correctly extracts and stores the container image.
+    This prevents regression of bugs where custom images are ignored.
+    """
+    print("Executing test:", test_case.name)
+    try:
+        # Create container list based on test case
+        if test_case.config.get("multiple_containers"):
+            # Test case with multiple containers - should prefer 'node' container
+            containers = [
+                {
+                    "name": "sidecar",
+                    "image": "wrong-sidecar-image:v1.0",
+                },
+                {
+                    "name": "node",
+                    "image": test_case.config["custom_image"],
+                },
+            ]
+        else:
+            # Single container test case
+            containers = [
+                {
+                    "name": "trainer",
+                    "image": test_case.config["custom_image"],
+                }
+            ]
+
+        # Create runtime YAML with custom image
+        runtime_yaml = {
+            "kind": "ClusterTrainingRuntime",
+            "metadata": {
+                "name": test_case.config["runtime_name"],
+                "labels": {"trainer.kubeflow.org/framework": test_case.config["framework"]},
+            },
+            "spec": {
+                "mlPolicy": {"numNodes": test_case.config["num_nodes"]},
+                "template": {
+                    "spec": {
+                        "replicatedJobs": [
+                            {
+                                "name": "node",
+                                "template": {
+                                    "spec": {"template": {"spec": {"containers": containers}}}
+                                },
+                            }
+                        ]
+                    }
+                },
+            },
+        }
+
+        runtime = runtime_loader._parse_runtime_yaml(runtime_yaml, "test")
+
+        # Verify image is extracted and stored
+        assert runtime.image == test_case.config["custom_image"]
+        assert runtime.name == test_case.config["runtime_name"]
+        assert runtime.trainer.framework == test_case.config["framework"]
+        assert runtime.trainer.num_nodes == test_case.config["num_nodes"]
+
+        assert test_case.expected_status == SUCCESS
+
+    except Exception as e:
+        assert type(e) is test_case.expected_error
+    print("test execution complete")
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        TestCase(
+            name="resolve image uses custom image",
+            expected_status=SUCCESS,
+            config={
+                "custom_image": "my-registry.io/pytorch-custom:arm64",
+                "framework": "torch",
+                "expect_custom": True,
+            },
+        ),
+        TestCase(
+            name="resolve image falls back to default when no custom image",
+            expected_status=SUCCESS,
+            config={
+                "custom_image": None,
+                "framework": "torch",
+                "expect_custom": False,
+            },
+        ),
+    ],
+)
+def test_resolve_image_uses_custom_image(test_case):
+    """
+    Test that resolve_image prioritizes runtime.image over default framework images.
+    This ensures custom images from ClusterTrainingRuntimes are actually used.
+    """
+    print("Executing test:", test_case.name)
+    try:
+        from kubeflow.trainer.backends.container import utils
+
+        # Create runtime with or without custom image
+        runtime = base_types.Runtime(
+            name="test-runtime",
+            trainer=base_types.RuntimeTrainer(
+                trainer_type=base_types.TrainerType.CUSTOM_TRAINER,
+                framework=test_case.config["framework"],
+                num_nodes=1,
+            ),
+            image=test_case.config["custom_image"],
+        )
+
+        resolved_image = utils.resolve_image(runtime)
+
+        if test_case.config["expect_custom"]:
+            # Should use custom image
+            assert resolved_image == test_case.config["custom_image"]
+        else:
+            # Should fall back to default
+            assert (
+                resolved_image == constants.DEFAULT_FRAMEWORK_IMAGES[test_case.config["framework"]]
+            )
+            assert "pytorch/pytorch" in resolved_image
 
         assert test_case.expected_status == SUCCESS
 

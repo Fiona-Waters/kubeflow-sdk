@@ -250,6 +250,7 @@ class Runtime:
     name: str
     trainer: RuntimeTrainer
     pretrained_model: Optional[str] = None
+    image: Optional[str] = None
 
 
 # Representation for the TrainJob steps.

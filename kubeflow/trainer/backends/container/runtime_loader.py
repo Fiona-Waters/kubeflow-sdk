@@ -329,6 +329,7 @@ def _create_default_runtimes() -> list[base_types.Runtime]:
                 num_nodes=1,
             ),
             pretrained_model=None,
+            image=image,
         )
         default_runtimes.append(runtime)
         logger.debug(f"Created default runtime: {runtime.name} with image {image}")
@@ -385,8 +386,27 @@ def _parse_runtime_yaml(data: dict[str, Any], source: str = "unknown") -> base_t
         )
     node_spec = node_jobs[0].get("template", {}).get("spec", {}).get("template", {}).get("spec", {})
     containers = node_spec.get("containers", [])
-    if not containers or not containers[0].get("image"):
-        raise ValueError(f"Runtime {name} from {source} 'node' must specify containers[0].image")
+    if not containers:
+        raise ValueError(f"Runtime {name} from {source} 'node' must specify at least one container")
+
+    # Extract the container image from the container named 'node', or fallback to first container
+    image = None
+    for container in containers:
+        if container.get("name") == "node" and container.get("image"):
+            image = container.get("image")
+            break
+
+    # Fallback to first container with an image if no 'node' container found
+    if not image:
+        for container in containers:
+            if container.get("image"):
+                image = container.get("image")
+                break
+
+    if not image:
+        raise ValueError(
+            f"Runtime {name} from {source} 'node' must specify an image in at least one container"
+        )
 
     return base_types.Runtime(
         name=name,
@@ -396,6 +416,7 @@ def _parse_runtime_yaml(data: dict[str, Any], source: str = "unknown") -> base_t
             num_nodes=num_nodes,
         ),
         pretrained_model=None,
+        image=image,
     )
 
 
