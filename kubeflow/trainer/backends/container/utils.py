@@ -227,16 +227,22 @@ def build_initializer_command(initializer: types.BaseInitializer, init_type: str
     Raises:
         ValueError: If the initializer type is not supported.
     """
-    # Use the training-operator initializer script
-    # The initializer script is expected to be available in the image
+    # Use the trainer repo initializer module structure (pkg.initializers.*)
+    # This matches the separate kubeflow/dataset-initializer and kubeflow/model-initializer images
     if isinstance(initializer, (types.S3DatasetInitializer, types.S3ModelInitializer)):
-        python_cmd = "python -m kubeflow.storage_initializer.s3 "
+        if init_type == "dataset":
+            python_cmd = "python -m pkg.initializers.dataset"
+        else:
+            python_cmd = "python -m pkg.initializers.model"
     elif isinstance(
         initializer, (types.HuggingFaceDatasetInitializer, types.HuggingFaceModelInitializer)
     ):
-        python_cmd = "python -m kubeflow.storage_initializer.hugging_face "
+        if init_type == "dataset":
+            python_cmd = "python -m pkg.initializers.dataset"
+        else:
+            python_cmd = "python -m pkg.initializers.model"
     elif isinstance(initializer, types.DataCacheInitializer):
-        python_cmd = "python -m kubeflow.storage_initializer.datacache "
+        python_cmd = "python -m pkg.initializers.dataset"
     else:
         raise ValueError(
             f"Unsupported initializer type: {type(initializer).__name__}. "
@@ -308,14 +314,26 @@ def build_initializer_env(initializer: types.BaseInitializer, init_type: str) ->
     return env
 
 
-def get_initializer_image(config) -> str:
+def get_initializer_image(config, init_type: str = "dataset") -> str:
     """
     Get the container image for initializers from backend config.
 
     Args:
         config: ContainerBackendConfig with initializer_image setting.
+        init_type: Type of initializer ("dataset" or "model").
 
     Returns:
         Container image name for initializers.
     """
-    return config.initializer_image
+    # If the config specifies a custom image, use it
+    image = config.initializer_image
+
+    # If using the default trainer repo images, select the appropriate one based on type
+    # The trainer repo has separate images: dataset-initializer and model-initializer
+    if "dataset-initializer" in image or "model-initializer" in image:
+        if init_type == "model":
+            image = image.replace("dataset-initializer", "model-initializer")
+        else:
+            image = image.replace("model-initializer", "dataset-initializer")
+
+    return image
