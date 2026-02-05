@@ -156,6 +156,7 @@ def _create_training_hub_progression_instrumentation(
     # fmt: off
     SFT_METRICS_FILE_PATTERN = "training_params_and_metrics_global*.jsonl"  # noqa: N806, F841
     SFT_METRICS_FILE_RANK0 = "training_params_and_metrics_global0.jsonl"  # noqa: N806
+    OSFT_METRICS_FILE_PATTERN = "training_metrics_*.jsonl"  # noqa: N806, F841
     OSFT_METRICS_FILE_RANK0 = "training_metrics_0.jsonl"  # noqa: N806, F841
     OSFT_CONFIG_FILE = "training_params.json"  # noqa: N806, F841
     # fmt: on
@@ -494,42 +495,54 @@ def _create_training_hub_progression_instrumentation(
         # Clean stale metrics files from previous runs
         # Since backends restart training from step 0 without checkpoint resumption,
         # old metrics files should be deleted to avoid showing stale/incorrect progress
-        try:
-            print("[Kubeflow] Cleaning stale metrics files", flush=True)
+        # Only the primary pod (rank 0, identified by -node-0 suffix in hostname) performs cleanup
+        # If pod name cannot be determined, assume primary pod (single pod or test environment)
+        hostname = os.environ.get("HOSTNAME", "")
+        pod_name_env = os.environ.get("POD_NAME")
+        pod_name = pod_name_env or hostname
+        is_primary_pod = pod_name_env is None or pod_name.endswith("-node-0")
 
-            # Determine file patterns based on algorithm
-            if algorithm == "sft":
-                patterns = [SFT_METRICS_FILE_PATTERN]
-            elif algorithm == "osft":
-                # All ranks
-                patterns = [
-                    OSFT_METRICS_FILE_RANK0.replace("_0.jsonl", "_*.jsonl"),
-                ]
-            else:
-                patterns = []
+        if is_primary_pod:
+            try:
+                print("[Kubeflow] Primary pod cleaning stale metrics files", flush=True)
 
-            # Delete matching files
-            files_removed = 0
-            for pattern in patterns:
-                full_pattern = os.path.join(ckpt_output_dir, pattern)
-                for file_path in glob.glob(full_pattern):
-                    try:
-                        os.remove(file_path)
-                        files_removed += 1
-                        filename = os.path.basename(file_path)
-                        print(f"[Kubeflow] Removed stale metrics file: {filename}", flush=True)
-                    except OSError as e:
-                        filename = os.path.basename(file_path)
-                        print(f"[Kubeflow] Warning: Could not remove {filename}: {e}", flush=True)
+                # Determine file patterns based on algorithm
+                if algorithm == "sft":
+                    patterns = [SFT_METRICS_FILE_PATTERN]
+                elif algorithm == "osft":
+                    # All ranks
+                    patterns = [OSFT_METRICS_FILE_PATTERN]
+                else:
+                    patterns = []
 
-            if files_removed > 0:
-                file_word = "files" if files_removed != 1 else "file"
-                print(f"[Kubeflow] Cleaned {files_removed} stale metrics {file_word}", flush=True)
-            else:
-                print("[Kubeflow] No stale metrics files found", flush=True)
+                # Delete matching files
+                files_removed = 0
+                for pattern in patterns:
+                    full_pattern = os.path.join(ckpt_output_dir, pattern)
+                    for file_path in sorted(glob.glob(full_pattern)):
+                        try:
+                            os.remove(file_path)
+                            files_removed += 1
+                            filename = os.path.basename(file_path)
+                            print(f"[Kubeflow] Removed stale metrics file: {filename}", flush=True)
+                        except OSError as e:
+                            filename = os.path.basename(file_path)
+                            print(
+                                f"[Kubeflow] Warning: Could not remove {filename}: {e}", flush=True
+                            )
 
-        except OSError as e:
-            print(f"[Kubeflow] Warning: Metrics cleanup failed: {e}", flush=True)
+                if files_removed > 0:
+                    file_word = "files" if files_removed != 1 else "file"
+                    print(
+                        f"[Kubeflow] Cleaned {files_removed} stale metrics {file_word}", flush=True
+                    )
+                else:
+                    print("[Kubeflow] No stale metrics files found", flush=True)
+
+            except OSError as e:
+                print(f"[Kubeflow] Warning: Metrics cleanup failed: {e}", flush=True)
+        else:
+            print("[Kubeflow] Non-primary pod skipping metrics cleanup", flush=True)
 
         # Start HTTP server for metrics
         try:
