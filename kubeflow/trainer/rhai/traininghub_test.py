@@ -198,7 +198,7 @@ def test_metrics_port_validation(test_case):
                 ("def apply_progression_tracking", True),
                 ("def _read_sft_metrics", True),
                 ("def _transform_sft", True),
-                ('algorithm="sft"', True),
+                ("algorithm_metadata=", True),
                 ("/tmp/checkpoints", True),
                 ("metrics_port=28080", True),
             ],
@@ -213,7 +213,7 @@ def test_metrics_port_validation(test_case):
                 ("def apply_progression_tracking", True),
                 ("def _read_osft_metrics", True),
                 ("def _transform_osft", True),
-                ('algorithm="osft"', True),
+                ("algorithm_metadata=", True),
                 ("/tmp/outputs", True),
                 ("metrics_port=28090", True),
             ],
@@ -230,15 +230,15 @@ def test_metrics_port_validation(test_case):
             ],
         ),
         TestCase(
-            name="structure - function call and constants",
+            name="structure - function call and metadata",
             expected_status="success",
             config={"algorithm": "sft", "ckpt_output_dir": "/tmp", "port": 28080},
             expected_output=[
                 ("apply_progression_tracking", True),
                 ("apply_progression_tracking()", True),
-                ("SFT_METRICS_FILE_RANK0", True),
-                ("OSFT_METRICS_FILE_RANK0", True),
-                ("OSFT_CONFIG_FILE", True),
+                ("algorithm_metadata", True),
+                ("metrics_file_pattern", True),
+                ("metrics_file_rank0", True),
             ],
         ),
         TestCase(
@@ -299,9 +299,9 @@ def test_instrumentation_wrapper_no_syntax_errors():
     print("test execution complete")
 
 
-def test_instrumentation_constants_embedded():
-    """Test that file path constants are embedded in the wrapper."""
-    print("Executing test: Constants are embedded")
+def test_instrumentation_metadata_embedded():
+    """Test that algorithm metadata is embedded in the wrapper."""
+    print("Executing test: Algorithm metadata is embedded")
 
     wrapper = get_training_hub_instrumentation_wrapper(
         algorithm="sft",
@@ -309,12 +309,14 @@ def test_instrumentation_constants_embedded():
         metrics_port=28080,
     )
 
-    # Verify constants are defined in the wrapper
-    assert 'SFT_METRICS_FILE_PATTERN = "training_params_and_metrics_global*.jsonl"' in wrapper
-    assert 'SFT_METRICS_FILE_RANK0 = "training_params_and_metrics_global0.jsonl"' in wrapper
-    assert 'OSFT_METRICS_FILE_PATTERN = "training_metrics_*.jsonl"' in wrapper
-    assert 'OSFT_METRICS_FILE_RANK0 = "training_metrics_0.jsonl"' in wrapper
-    assert 'OSFT_CONFIG_FILE = "training_params.json"' in wrapper
+    # Verify algorithm metadata dict is passed to the instrumentation function
+    assert "algorithm_metadata=" in wrapper
+    assert "'name': 'sft'" in wrapper
+    assert "'metrics_file_pattern':" in wrapper
+    assert "'metrics_file_rank0':" in wrapper
+    # Verify the metadata extraction in the function
+    assert 'algorithm = algorithm_metadata["name"]' in wrapper
+    assert 'metrics_file_pattern = algorithm_metadata["metrics_file_pattern"]' in wrapper
 
     print("test execution complete")
 
@@ -329,9 +331,9 @@ def test_algorithm_parameter_used_not_detected():
         metrics_port=28080,
     )
 
-    # Verify algorithm parameter is used in conditionals
-    assert 'if algorithm == "osft"' in wrapper
-    assert 'if algorithm == "sft"' in wrapper or "else:  # sft" in wrapper
+    # Verify algorithm metadata is used (extracted from centralized registry)
+    assert "algorithm_metadata" in wrapper
+    assert 'algorithm = algorithm_metadata["name"]' in wrapper
 
     # Verify NO heuristic detection based on metrics keys
     assert 'if "tokens_per_second" in metrics' not in wrapper
@@ -565,6 +567,7 @@ def test_traininghub_wrapper_reraises_failure(test_case: TestCase, capsys):
     """Generate wrapper code and assert it re-raises exceptions."""
     print(f"Executing test: {test_case.name}")
 
+    from kubeflow.trainer.algorithms import get_algorithm_pod_metadata
     from kubeflow.trainer.rhai.traininghub import _render_algorithm_wrapper
 
     # Arrange: fake training_hub module that raises
@@ -574,7 +577,8 @@ def test_traininghub_wrapper_reraises_failure(test_case: TestCase, capsys):
     # command. Executing this code simulates what actually runs inside the training pod
     # (without the surrounding bash heredoc). The dummy training_hub installed above
     # ensures the selected algorithm raises so we can assert failure propagation.
-    code = _render_algorithm_wrapper(test_case.config["algorithm"], {"ckpt_output_dir": "/tmp"})
+    algorithm_metadata = get_algorithm_pod_metadata(test_case.config["algorithm"])
+    code = _render_algorithm_wrapper(algorithm_metadata, {"ckpt_output_dir": "/tmp"})
 
     # Act / Assert
     # Execute the generated wrapper code in-process. Because we installed a dummy
@@ -635,19 +639,22 @@ def test_algorithm_wrapper_termination_message():
     """Test that algorithm wrapper includes termination message writing after training."""
     print("Executing test: Algorithm wrapper termination message (on_train_end)")
 
+    from kubeflow.trainer.algorithms import get_algorithm_pod_metadata
     from kubeflow.trainer.rhai.traininghub import _render_algorithm_wrapper
 
-    wrapper = _render_algorithm_wrapper("sft", {"ckpt_output_dir": "/tmp/checkpoints"})
+    algorithm_metadata = get_algorithm_pod_metadata("sft")
+    wrapper = _render_algorithm_wrapper(algorithm_metadata, {"ckpt_output_dir": "/tmp/checkpoints"})
 
     # Verify _write_termination_message function is defined
-    assert "def _write_termination_message(ckpt_output_dir, algorithm):" in wrapper
+    assert (
+        "def _write_termination_message(ckpt_output_dir, algorithm, metrics_file_rank0):" in wrapper
+    )
     # Verify it's called after training completes
-    assert "_write_termination_message(ckpt_output_dir, algorithm)" in wrapper
+    assert "_write_termination_message(ckpt_output_dir, algorithm, metrics_file_rank0)" in wrapper
     # Verify termination log path is used
     assert '"/dev/termination-log"' in wrapper
-    # Verify it reads metrics files
-    assert "training_params_and_metrics_global0.jsonl" in wrapper  # SFT
-    assert "training_metrics_0.jsonl" in wrapper  # OSFT
+    # Verify it reads metrics files for SFT
+    assert "training_params_and_metrics_global0.jsonl" in wrapper
     # Verify docstring explains purpose
     assert "Kubernetes reads /dev/termination-log after container exit" in wrapper
 
@@ -658,9 +665,11 @@ def test_algorithm_wrapper_termination_handles_errors():
     """Test that algorithm wrapper termination handles errors gracefully."""
     print("Executing test: Algorithm wrapper termination error handling")
 
+    from kubeflow.trainer.algorithms import get_algorithm_pod_metadata
     from kubeflow.trainer.rhai.traininghub import _render_algorithm_wrapper
 
-    wrapper = _render_algorithm_wrapper("osft", {"ckpt_output_dir": "/tmp"})
+    algorithm_metadata = get_algorithm_pod_metadata("osft")
+    wrapper = _render_algorithm_wrapper(algorithm_metadata, {"ckpt_output_dir": "/tmp"})
 
     # Verify PermissionError is handled (not in container)
     assert "except PermissionError:" in wrapper
@@ -712,10 +721,12 @@ def test_instrumentation_cleans_sft_metrics_on_startup(tmp_path):
     stale_metrics_file_rank2.write_text('{"step": 100, "loss": 1.3}\n')
 
     # Call instrumentation directly (no exec) with port 0 for random available port
+    from kubeflow.trainer.algorithms import get_algorithm_pod_metadata
     from kubeflow.trainer.rhai.traininghub import _create_training_hub_progression_instrumentation
 
+    algorithm_metadata = get_algorithm_pod_metadata("sft")
     apply_fn, _handler = _create_training_hub_progression_instrumentation(
-        algorithm="sft",
+        algorithm_metadata=algorithm_metadata,
         ckpt_output_dir=str(ckpt_dir),
         metrics_port=0,  # Use port 0 for random available port
     )
@@ -765,10 +776,12 @@ def test_instrumentation_cleans_osft_metrics_on_startup(tmp_path):
     stale_config_file.write_text('{"max_epochs": 10}\n')
 
     # Call instrumentation directly (no exec) with port 0 for random available port
+    from kubeflow.trainer.algorithms import get_algorithm_pod_metadata
     from kubeflow.trainer.rhai.traininghub import _create_training_hub_progression_instrumentation
 
+    algorithm_metadata = get_algorithm_pod_metadata("osft")
     apply_fn, _handler = _create_training_hub_progression_instrumentation(
-        algorithm="osft",
+        algorithm_metadata=algorithm_metadata,
         ckpt_output_dir=str(ckpt_dir),
         metrics_port=0,  # Use port 0 for random available port
     )
@@ -808,10 +821,12 @@ def test_instrumentation_cleanup_handles_missing_files(tmp_path):
     ckpt_dir.mkdir()
 
     # Call instrumentation directly (no exec) with port 0 for random available port
+    from kubeflow.trainer.algorithms import get_algorithm_pod_metadata
     from kubeflow.trainer.rhai.traininghub import _create_training_hub_progression_instrumentation
 
+    algorithm_metadata = get_algorithm_pod_metadata("sft")
     apply_fn, _handler = _create_training_hub_progression_instrumentation(
-        algorithm="sft",
+        algorithm_metadata=algorithm_metadata,
         ckpt_output_dir=str(ckpt_dir),
         metrics_port=0,  # Use port 0 for random available port
     )
