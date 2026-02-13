@@ -358,6 +358,32 @@ def test_get_algorithm_pod_metadata_osft():
     print("test execution complete")
 
 
+def test_get_algorithm_pod_metadata_lora():
+    """Test get_algorithm_pod_metadata returns correct metadata for LoRA."""
+    print("Executing test: get_algorithm_pod_metadata_lora")
+
+    metadata = get_algorithm_pod_metadata("lora_sft")
+
+    assert metadata["name"] == "lora_sft"
+    assert metadata["metrics_file_pattern"] == "training_metrics.jsonl"
+    assert metadata["metrics_file_rank0"] == "training_metrics.jsonl"
+
+    print("test execution complete")
+
+
+def test_lora_metrics_patterns_match_constants():
+    """Test that LoRA metrics patterns match the patterns used in traininghub.py."""
+    print("Executing test: lora_metrics_patterns_match_constants")
+
+    spec = get_algorithm_spec("lora_sft")
+    patterns = list(spec.metrics_file_patterns)
+
+    # LoRA produces training_metrics.jsonl (no wildcard, single file)
+    assert "training_metrics.jsonl" in patterns
+
+    print("test execution complete")
+
+
 def test_get_algorithm_pod_metadata_unknown_raises():
     """Test get_algorithm_pod_metadata raises for unknown algorithm."""
     print("Executing test: get_algorithm_pod_metadata_unknown_raises")

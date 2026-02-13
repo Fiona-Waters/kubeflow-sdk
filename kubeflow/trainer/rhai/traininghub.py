@@ -348,12 +348,18 @@ def _create_training_hub_progression_instrumentation(
                 }
 
             # Use algorithm parameter to determine transformation
+            # NOTE: When adding a new algorithm WITH metrics files to algorithms.py,
+            #       you must add a corresponding elif branch and _transform_<algorithm>
+            #       method here to transform the algorithm's metrics schema to the
+            #       controller-compatible format.
             if algorithm == "sft":
                 return self._transform_sft(metrics)
             elif algorithm == "osft":
                 return self._transform_osft(metrics)
+            elif algorithm == "lora_sft":
+                return self._transform_lora_sft(metrics)
             else:
-                # Algorithms without metrics files (e.g., lora_sft) return empty dict
+                # Algorithms without metrics files (empty tuple in algorithms.py)
                 return {}
 
         def _transform_osft(self, metrics):
@@ -478,6 +484,43 @@ def _create_training_hub_progression_instrumentation(
                     "learning_rate": f"{lr_val:.6f}" if lr_val is not None else None,
                     "grad_norm": f"{grad_norm_val:.4f}" if grad_norm_val is not None else None,
                     "throughput": f"{throughput_val:.2f}" if throughput_val is not None else None,
+                },
+                "evalMetrics": {},
+            }
+
+        def _transform_lora_sft(self, metrics):
+            """Transform LoRA SFT schema to controller-compatible format.
+
+            LoRA metrics format:
+                {"step": 1, "epoch": 0.015625, "loss": 4.2727, "learning_rate": 2e-6}
+            """
+            step = metrics.get("step", 0)
+            epoch = metrics.get("epoch", 0)
+
+            # LoRA uses max_steps for training duration, not epochs
+            config = metrics.get("_config", {})
+            max_steps = config.get("max_steps", 0)
+
+            # Calculate progress based on steps
+            percent = min(100, step / max_steps * 100) if max_steps > 0 else 0
+
+            # Estimate remaining time (LoRA doesn't provide throughput metrics)
+            # We can't reliably estimate this without historical timing data
+            estimated_remaining_sec = None
+
+            loss_val = metrics.get("loss")
+            lr_val = metrics.get("learning_rate")
+
+            return {
+                "progressPercentage": int(round(percent)),
+                "estimatedRemainingSeconds": estimated_remaining_sec,
+                "currentStep": step,
+                "totalSteps": max_steps or step + 10,  # Conservative fallback
+                "currentEpoch": int(epoch) + 1,  # Convert 0-based to 1-based
+                "totalEpochs": None,  # LoRA uses steps, not epochs
+                "trainMetrics": {
+                    "loss": f"{loss_val:.4f}" if loss_val is not None else None,
+                    "learning_rate": f"{lr_val:.6f}" if lr_val is not None else None,
                 },
                 "evalMetrics": {},
             }
@@ -616,7 +659,7 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: Optional[dict
         import json
         import os
 
-        # Skip termination message for algorithms without metrics files (e.g., LoRA)
+        # Skip termination message for algorithms without metrics files
         if metrics_file_rank0 is None:
             print(
                 "[Kubeflow] Algorithm produces no metrics files - skipping termination message",

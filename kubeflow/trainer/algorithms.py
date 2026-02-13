@@ -37,7 +37,8 @@ class AlgorithmSpec:
     Attributes:
         name: The algorithm identifier (e.g., "sft", "osft").
         metrics_file_patterns: Glob patterns for metrics files written by this algorithm.
-            Used for metrics reading and cleanup operations.
+            Used for metrics reading and cleanup operations. Set to empty tuple () for
+            algorithms that don't produce metrics files (disables progress tracking).
         validate: Validation function that takes a training config and raises
             ValueError if the config is invalid for this algorithm.
     """
@@ -114,6 +115,10 @@ def _no_op_validate(config: Any) -> None:
 
 # Registry of all supported training algorithms
 # Each entry maps algorithm name to its specification
+#
+# Note: When adding algorithms WITHOUT metrics files, set metrics_file_patterns=()
+#       (empty tuple). This disables progress tracking for that algorithm.
+#       See module docstring for examples.
 ALGORITHMS: dict[str, AlgorithmSpec] = {
     "sft": AlgorithmSpec(
         name="sft",
@@ -127,7 +132,7 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
     ),
     "lora_sft": AlgorithmSpec(
         name="lora_sft",
-        metrics_file_patterns=(),  # LoRA uses HF Trainer logging, not JSONL metrics files
+        metrics_file_patterns=("training_metrics.jsonl",),
         validate=_no_op_validate,
     ),
 }
@@ -203,9 +208,9 @@ def get_algorithm_pod_metadata(name: str) -> dict:
         >>> metadata["metrics_file_rank0"]
         'training_params_and_metrics_global0.jsonl'
 
-        >>> metadata = get_algorithm_pod_metadata("lora_sft")  # No metrics
+        >>> metadata = get_algorithm_pod_metadata("lora_sft")
         >>> metadata["metrics_file_pattern"]
-        None
+        'training_metrics.jsonl'
     """
     # get_algorithm_spec() validates the name parameter
     spec = get_algorithm_spec(name)
