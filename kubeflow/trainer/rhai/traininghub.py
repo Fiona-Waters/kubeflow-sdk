@@ -563,13 +563,15 @@ def _create_training_hub_progression_instrumentation(
                     files_removed = 0
                     for pattern in patterns:
                         full_pattern = os.path.join(ckpt_output_dir, pattern)
+                        print(f"[Kubeflow] DEBUG: Cleanup pattern={full_pattern}", flush=True)
                         for file_path in sorted(glob.glob(full_pattern)):
                             try:
                                 os.remove(file_path)
                                 files_removed += 1
                                 filename = os.path.basename(file_path)
                                 print(
-                                    f"[Kubeflow] Removed stale metrics file: {filename}", flush=True
+                                    f"[Kubeflow] Removed stale metrics file: {file_path}",
+                                    flush=True,
                                 )
                             except OSError as e:
                                 filename = os.path.basename(file_path)
