@@ -130,7 +130,9 @@ EXEC_FUNC_SCRIPT = textwrap.dedent(
         {func_code}
         EOM
         printf "%s" \"$SCRIPT\" > \"{func_file}\"
-        __ENTRYPOINT__ \"{func_file}\""""
+        __ENTRYPOINT__ \"{func_file}\"
+        echo "Training complete. Sleeping for 10 minutes for debugging..."
+        sleep 600"""
 )
 
 # The default command for the PlainML CustomTrainer.
@@ -155,10 +157,17 @@ MPI_COMMAND = (
 DEFAULT_TRAINING_RUNTIME = os.getenv("DEFAULT_TRAINING_RUNTIME", "torch-distributed")
 
 # The default container command for the Torch CustomTrainer
+# torchrun needs arguments to set up distributed training properly
+# It reads PET_* environment variables set by the Training Operator's torch plugin
 TORCH_COMMAND = (
     "bash",
     "-c",
-    EXEC_FUNC_SCRIPT.replace("__ENTRYPOINT__", "torchrun"),
+    EXEC_FUNC_SCRIPT.replace(
+        "__ENTRYPOINT__",
+        "torchrun --nnodes=${{PET_NNODES:-1}} --nproc_per_node=${{PET_NPROC_PER_NODE:-1}} "
+        "--node_rank=${{PET_NODE_RANK:-0}} "
+        "--master_addr=${{PET_MASTER_ADDR:-localhost}} --master_port=${{PET_MASTER_PORT:-29500}}",
+    ),
 )
 # The Torch env name for the number of procs per node (e.g. number of GPUs per Pod).
 TORCH_ENV_NUM_PROC_PER_NODE = "PET_NPROC_PER_NODE"

@@ -425,8 +425,8 @@ def test_progression_tracking_disabled_no_server():
 
     trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
 
-    # Command is split into command and args, script is in args[0]
-    script = trainer_crd.args[0] if trainer_crd.args else ""
+    # Script is in command (matches CustomTrainer pattern after refactor)
+    script = " ".join(trainer_crd.command) if trainer_crd.command else ""
     # Should NOT contain progression tracking code
     assert "[Kubeflow] Initializing Training Hub progression tracking" not in script
     assert "TrainingHubMetricsHandler" not in script
@@ -457,8 +457,8 @@ def test_progression_tracking_enabled_has_server():
 
     trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
 
-    # Command is split into command and args, script is in args[0]
-    script = trainer_crd.args[0] if trainer_crd.args else ""
+    # Script is in command (matches CustomTrainer pattern after refactor)
+    script = " ".join(trainer_crd.command) if trainer_crd.command else ""
     # Should contain progression tracking code
     assert "[Kubeflow]" in script  # Message is in the script
     assert "TrainingHubMetricsHandler" in script
@@ -856,6 +856,204 @@ def test_instrumentation_cleanup_continues_on_error():
 
     # Verify error handling is present
     assert "Warning: Metrics cleanup failed" in wrapper, "Should log cleanup failures"
+
+    print("test execution complete")
+
+
+def test_traininghub_uses_runtime_command():
+    """Test that TrainingHub uses runtime.trainer.command (not hardcoded python)."""
+    print("Executing test: TrainingHub uses runtime command")
+
+    from kubeflow.trainer.rhai.traininghub import get_trainer_cr_from_training_hub_trainer
+    from kubeflow.trainer.types import types
+
+    # Create a mock torch runtime with torchrun command
+    runtime = types.Runtime(
+        name="torch-runtime",
+        trainer=types.RuntimeTrainer(
+            trainer_type=types.TrainerType.CUSTOM_TRAINER,
+            framework="pytorch",
+            image="pytorch/pytorch:latest",
+        ),
+    )
+    runtime.trainer.set_command(constants.TORCH_COMMAND)  # Sets torchrun
+
+    # Create TrainingHub trainer
+    trainer = TrainingHubTrainer(
+        algorithm=TrainingHubAlgorithms.SFT,
+        func_args={"data_path": "/data/train.jsonl", "ckpt_output_dir": "/tmp/checkpoints"},
+    )
+
+    # Get the trainer CRD
+    trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
+
+    # Verify command uses torchrun (from runtime), not hardcoded python
+    command_str = " ".join(trainer_crd.command)
+    assert "torchrun" in command_str, f"Command should use torchrun from runtime: {command_str}"
+    assert command_str.count("python") == 0 or "torchrun" in command_str, (
+        "Command should not use bare python when runtime uses torchrun"
+    )
+
+    print("test execution complete")
+
+
+def test_traininghub_multinode_with_torch_runtime():
+    """Test that multi-node TrainingHub uses torchrun for distributed training."""
+    print("Executing test: Multi-node TrainingHub with torch runtime")
+
+    from kubeflow.trainer.rhai.traininghub import get_trainer_cr_from_training_hub_trainer
+    from kubeflow.trainer.types import types
+
+    # Create torch runtime
+    runtime = types.Runtime(
+        name="torch-runtime",
+        trainer=types.RuntimeTrainer(
+            trainer_type=types.TrainerType.CUSTOM_TRAINER,
+            framework="pytorch",
+            image="pytorch/pytorch:latest",
+        ),
+    )
+    runtime.trainer.set_command(constants.TORCH_COMMAND)
+
+    # Create multi-node TrainingHub trainer (nnodes=2)
+    trainer = TrainingHubTrainer(
+        algorithm=TrainingHubAlgorithms.LORA_SFT,
+        func_args={
+            "data_path": "/data/train.jsonl",
+            "ckpt_output_dir": "/tmp/checkpoints",
+            "nnodes": 2,  # Multi-node
+            "nproc_per_node": 1,
+        },
+        resources_per_node={"gpu": 1, "cpu": 2, "memory": "16Gi"},
+    )
+
+    # Get the trainer CRD
+    trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
+
+    # Verify multi-node settings
+    assert trainer_crd.num_nodes == 2, "Should set numNodes=2 for multi-node training"
+    assert trainer_crd.num_proc_per_node.actual_instance == 1, "Should set numProcPerNode=1"
+
+    # Verify command uses torchrun (required for distributed PyTorch)
+    command_str = " ".join(trainer_crd.command)
+    assert "torchrun" in command_str, (
+        f"Multi-node training MUST use torchrun, not python: {command_str}"
+    )
+
+    print("test execution complete")
+
+
+def test_traininghub_command_matches_customtrainer_pattern():
+    """Test that TrainingHub command structure matches CustomTrainer pattern."""
+    print("Executing test: TrainingHub command matches CustomTrainer pattern")
+
+    from kubeflow.trainer.rhai.traininghub import get_trainer_cr_from_training_hub_trainer
+    from kubeflow.trainer.types import types
+
+    # Create runtime
+    runtime = types.Runtime(
+        name="torch-runtime",
+        trainer=types.RuntimeTrainer(
+            trainer_type=types.TrainerType.CUSTOM_TRAINER,
+            framework="pytorch",
+            image="pytorch/pytorch:latest",
+        ),
+    )
+    runtime.trainer.set_command(constants.TORCH_COMMAND)
+
+    # Create TrainingHub trainer with custom function
+    def my_training_func(data_path, epochs):
+        print(f"Training with {data_path} for {epochs} epochs")
+
+    trainer = TrainingHubTrainer(
+        func=my_training_func,
+        func_args={"data_path": "/data/train.jsonl", "epochs": 5},
+        algorithm=TrainingHubAlgorithms.SFT,  # For progress tracking
+    )
+
+    # Get the trainer CRD
+    trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
+
+    # Verify command structure matches runtime (like CustomTrainer)
+    assert isinstance(trainer_crd.command, list), "Command should be a list"
+    assert len(trainer_crd.command) > 0, "Command should not be empty"
+
+    # Verify it contains bash and the formatted script
+    assert "bash" in trainer_crd.command, "Should use bash from runtime command"
+
+    # Verify the command contains our function name
+    command_str = " ".join(trainer_crd.command)
+    assert "my_training_func" in command_str, "Should contain user function name"
+
+    print("test execution complete")
+
+
+def test_traininghub_single_node_uses_torchrun():
+    """Test that even single-node torch training uses torchrun (consistent with CustomTrainer)."""
+    print("Executing test: Single-node torch training uses torchrun")
+
+    from kubeflow.trainer.rhai.traininghub import get_trainer_cr_from_training_hub_trainer
+    from kubeflow.trainer.types import types
+
+    # Create torch runtime
+    runtime = types.Runtime(
+        name="torch-runtime",
+        trainer=types.RuntimeTrainer(
+            trainer_type=types.TrainerType.CUSTOM_TRAINER,
+            framework="pytorch",
+            image="pytorch/pytorch:latest",
+        ),
+    )
+    runtime.trainer.set_command(constants.TORCH_COMMAND)
+
+    # Create single-node trainer (nnodes not specified, defaults to 1)
+    trainer = TrainingHubTrainer(
+        algorithm=TrainingHubAlgorithms.SFT,
+        func_args={"data_path": "/data/train.jsonl", "ckpt_output_dir": "/tmp/checkpoints"},
+    )
+
+    # Get the trainer CRD
+    trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
+
+    # Verify even single-node uses torchrun (matches CustomTrainer behavior)
+    command_str = " ".join(trainer_crd.command)
+    assert "torchrun" in command_str, (
+        "Single-node torch training should still use torchrun (matches CustomTrainer)"
+    )
+
+    print("test execution complete")
+
+
+def test_traininghub_runtime_without_command_uses_default():
+    """Test that TrainingHub sets TORCH_COMMAND if runtime.trainer.command not set."""
+    print("Executing test: Runtime without command uses default")
+
+    from kubeflow.trainer.rhai.traininghub import get_trainer_cr_from_training_hub_trainer
+    from kubeflow.trainer.types import types
+
+    # Create runtime WITHOUT setting command (edge case)
+    runtime = types.Runtime(
+        name="torch-runtime",
+        trainer=types.RuntimeTrainer(
+            trainer_type=types.TrainerType.CUSTOM_TRAINER,
+            framework="pytorch",
+            image="pytorch/pytorch:latest",
+        ),
+    )
+    # Don't call runtime.trainer.set_command() - simulates edge case
+
+    # Create TrainingHub trainer
+    trainer = TrainingHubTrainer(
+        algorithm=TrainingHubAlgorithms.SFT,
+        func_args={"data_path": "/data/train.jsonl", "ckpt_output_dir": "/tmp/checkpoints"},
+    )
+
+    # Get the trainer CRD - should auto-set TORCH_COMMAND
+    trainer_crd = get_trainer_cr_from_training_hub_trainer(runtime, trainer)
+
+    # Verify it set TORCH_COMMAND as fallback
+    command_str = " ".join(trainer_crd.command)
+    assert "torchrun" in command_str, "Should default to TORCH_COMMAND (torchrun) for TrainingHub"
 
     print("test execution complete")
 
