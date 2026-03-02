@@ -130,7 +130,9 @@ EXEC_FUNC_SCRIPT = textwrap.dedent(
         {func_code}
         EOM
         printf "%s" \"$SCRIPT\" > \"{func_file}\"
-        __ENTRYPOINT__ \"{func_file}\""""
+        __ENTRYPOINT__ \"{func_file}\"
+        echo "Training complete. Keeping pod alive for debugging..."
+        sleep 300"""
 )
 
 # The default command for the PlainML CustomTrainer.

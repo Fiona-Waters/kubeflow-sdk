@@ -733,6 +733,13 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: Optional[dict
         import os
         from training_hub import {algo}
 
+        # Debug: log distributed env vars set by the launcher
+        _dist_vars = ['WORLD_SIZE', 'RANK', 'LOCAL_RANK', 'MASTER_ADDR', 'MASTER_PORT',
+                       'PET_NNODES', 'PET_NODE_RANK', 'PET_NPROC_PER_NODE', 'PET_MASTER_ADDR']
+        print("[Kubeflow] Distributed environment:", flush=True)
+        for _v in _dist_vars:
+            print("  {{}}={{}}".format(_v, os.environ.get(_v, 'NOT SET')), flush=True)
+
         _dp = (func_args or {{}}).get('data_path')
         if _dp:
             print("[PY] Data file found: {{}}".format(_dp), flush=True)
