@@ -891,7 +891,7 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: dict | None) 
         # https://github.com/Red-Hat-AI-Innovation-Team/training_hub/pull/78
         # Patch _subprocess_entry to not write error_path when results already exist,
         # preventing pod restarts caused by ART cleanup exceptions after training completes.
-        import importlib
+        import importlib.util
         _th_spec = importlib.util.find_spec("training_hub")
         if _th_spec and _th_spec.submodule_search_locations:
             _lora_grpo_path = os.path.join(
