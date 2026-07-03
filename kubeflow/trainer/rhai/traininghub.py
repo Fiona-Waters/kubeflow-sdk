@@ -887,15 +887,36 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: dict | None) 
 
     def training_func(func_args):
         import os
-        import subprocess
-        import sys
-        # TODO: Remove once the training image includes openpipe-art >= 0.5.18
-        # Upgrade ART to include the fix for graceful shutdown of monitor tasks
-        # (https://github.com/OpenPipe/ART/pull/669) which prevents pod restarts.
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "--quiet", "--no-deps",
-            "openpipe-art @ git+https://github.com/OpenPipe/ART.git@099e6b2",
-        ])
+        # TODO: Remove once the training image includes training_hub with
+        # https://github.com/Red-Hat-AI-Innovation-Team/training_hub/pull/78
+        # Patch _subprocess_entry to not write error_path when results already exist,
+        # preventing pod restarts caused by ART cleanup exceptions after training completes.
+        import importlib
+        _th_spec = importlib.util.find_spec("training_hub")
+        if _th_spec and _th_spec.submodule_search_locations:
+            _lora_grpo_path = os.path.join(
+                _th_spec.submodule_search_locations[0], "algorithms", "lora_grpo.py"
+            )
+            if os.path.exists(_lora_grpo_path):
+                with open(_lora_grpo_path) as _f:
+                    _src = _f.read()
+                _old = (
+                    "        except Exception as e:\\n"
+                    "            with open(error_path, \\"w\\") as f:\\n"
+                    "                import traceback\\n"
+                    "                f.write(traceback.format_exc())"
+                )
+                if _old in _src:
+                    _new = (
+                        "        except Exception as e:\\n"
+                        "            if not os.path.exists(results_path):\\n"
+                        "                with open(error_path, \\"w\\") as f:\\n"
+                        "                    import traceback\\n"
+                        "                    f.write(traceback.format_exc())"
+                    )
+                    with open(_lora_grpo_path, "w") as _f:
+                        _f.write(_src.replace(_old, _new))
+                    print("[PY] Patched training_hub lora_grpo.py (PR #78 workaround)", flush=True)
         from training_hub import {algo}
 
         _dp = (func_args or {{}}).get('data_path')
