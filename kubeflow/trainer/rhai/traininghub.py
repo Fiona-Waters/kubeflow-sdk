@@ -943,6 +943,14 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: dict | None) 
             print("Configuration error:", e, flush=True)
             # Propagate configuration errors so the pod fails
             raise
+        except ConnectionRefusedError:
+            # TODO: Remove once the training image includes ART with
+            # https://github.com/openpipe/art/pull/669
+            # ART's _monitor_openai_server task throws ConnectionRefusedError
+            # when vLLM shuts down after training completes. This is benign —
+            # training already finished, so treat it as success.
+            print("[PY] {algo_upper} training complete (caught ART cleanup error).", flush=True)
+            _write_termination_message(ckpt_output_dir, algorithm, metrics_file_rank0)
         except Exception as e:
             import traceback
             print("[PY] Training failed with error:", e, flush=True)
