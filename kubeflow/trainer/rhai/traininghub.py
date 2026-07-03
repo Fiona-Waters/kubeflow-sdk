@@ -893,7 +893,7 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: dict | None) 
         # Upgrade ART to include the fix for graceful shutdown of monitor tasks
         # (https://github.com/OpenPipe/ART/pull/669) which prevents pod restarts.
         subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "--quiet",
+            sys.executable, "-m", "pip", "install", "--quiet", "--no-deps",
             "openpipe-art @ git+https://github.com/OpenPipe/ART.git@099e6b2",
         ])
         from training_hub import {algo}
