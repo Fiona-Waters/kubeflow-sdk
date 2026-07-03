@@ -887,6 +887,15 @@ def _render_algorithm_wrapper(algorithm_metadata: dict, func_args: dict | None) 
 
     def training_func(func_args):
         import os
+        import subprocess
+        import sys
+        # TODO: Remove once the training image includes openpipe-art >= 0.5.18
+        # Upgrade ART to include the fix for graceful shutdown of monitor tasks
+        # (https://github.com/OpenPipe/ART/pull/669) which prevents pod restarts.
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "--quiet",
+            "openpipe-art @ git+https://github.com/OpenPipe/ART.git@main",
+        ])
         from training_hub import {algo}
 
         _dp = (func_args or {{}}).get('data_path')
